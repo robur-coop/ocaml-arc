@@ -2,6 +2,8 @@ let src = Logs.Src.create "arc"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
+[@@@warning "-27-32"]
+
 (* An ARC set *)
 type t = {
     results : results
@@ -13,6 +15,7 @@ type t = {
 and signature = Dkim.signed Dkim.t
 and seal = Dkim.signed Dkim.t
 and results = Dmarc.Authentication_results.t
+and domain_key = Dkim.domain_key
 
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
@@ -106,7 +109,9 @@ module Verify = struct
     ; state : state
   }
 
-  and decode = [ `Await of decoder | `Sets of t list | `Malformed of string ]
+  and decode =
+    [ `Await of decoder | `Query of t | `Sets of t list | `Malformed of string ]
+
   and state =
     | Extraction of Mrmime.Hd.decoder * field list
     | Queries of string * t list * t list
@@ -115,6 +120,9 @@ module Verify = struct
     | Message_signature of int * Dkim.signed Dkim.t
     | Authentication_results of int * Dmarc.Authentication_results.t
     | Seal of int * Dkim.signed Dkim.t
+
+  and query = |
+  and response = [ `Expired | `Domain_key of domain_key | `DNS_error of string ]
 
   let pp_field ppf = function
     | Message_signature _ -> Fmt.string ppf "Message-Signature"
@@ -155,6 +163,7 @@ module Verify = struct
     | Extraction (v, _) ->
         Mrmime.Hd.src v src idx len ;
         if len == 0 then end_of_input decoder else decoder
+    | Queries _ -> assert false
 
   let src_rem decoder = decoder.input_len - decoder.input_pos + 1
 
@@ -196,7 +205,6 @@ module Verify = struct
       | `End prelude ->
           let fields : field list = fields in
           let fields = List.sort compare_field fields in
-          Fmt.epr ">>> @[<hov>%a@]\n%!" Fmt.(Dump.list pp_field) fields;
           let rec aggregate sets = function
             | [] -> sets
             | Authentication_results (u0, results)
@@ -223,11 +231,14 @@ module Verify = struct
           `Await t in
     go fields
 
-  and queries todo sets = match todo with
-    | [] -> assert false
-    | set :: todo -> `Query set
+  and queries todo sets =
+    match todo with [] -> assert false | set :: todo -> `Query set
 
   and decode t =
     match t.state with
     | Extraction (decoder, fields) -> extract t decoder fields
+    | Queries _ -> assert false
+
+  let queries _ = []
+  let response decoder _ _ = decoder
 end

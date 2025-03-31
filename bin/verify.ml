@@ -1,8 +1,6 @@
 let reporter ppf =
   let report src level ~over k msgf =
-    let k _ =
-      over () ;
-      k () in
+    let k _ = over () ; k () in
     let with_metadata header _tags k ppf fmt =
       Format.kfprintf k ppf
         ("%a[%a]: " ^^ fmt ^^ "\n%!")
@@ -18,7 +16,8 @@ let () = Logs.set_level ~all:true (Some Logs.Debug)
 
 let () =
   let buf = Bytes.create 0x7ff in
-  let rec go decoder = match Arc.Verify.decode decoder with
+  let rec go decoder =
+    match Arc.Verify.decode decoder with
     | `Await decoder ->
         let len = input stdin buf 0 (Bytes.length buf) in
         let str = Bytes.sub_string buf 0 len in
@@ -26,12 +25,10 @@ let () =
         let str = String.concat "\r\n" str in
         let decoder = Arc.Verify.src decoder str 0 (String.length str) in
         go decoder
-    | `Query set (* the ARC-set with uid=? *) ->
-        let queries (* DNS.Record.t * Domain_name.t *) = Arc.Verify.dns_queries set in
-        let response = List.map (fun (r, dn) -> DNS.get_record r dn) queries in
-        let decoder = Arc.Verify.response decoder set response in
-        go decoder 
-    | `Sets sets ->
-        Fmt.pr ">>> %d set(s)\n%!" (List.length sets)
+    | `Query set ->
+        let _queries = Arc.Verify.queries set in
+        let decoder = Arc.Verify.response decoder set [] in
+        go decoder
+    | `Sets sets -> Fmt.pr ">>> %d set(s)\n%!" (List.length sets)
     | `Malformed err -> failwith err in
   go (Arc.Verify.decoder ())
