@@ -16,6 +16,7 @@ let () = Logs.set_level ~all:true (Some Logs.Debug)
 
 let () =
   let buf = Bytes.create 0x7ff in
+  let ( let* ) = Result.bind in
   let rec go decoder =
     match Arc.Verify.decode decoder with
     | `Await decoder ->
@@ -26,9 +27,11 @@ let () =
         let decoder = Arc.Verify.src decoder str 0 (String.length str) in
         go decoder
     | `Query set ->
-        let _queries = Arc.Verify.queries set in
-        let decoder = Arc.Verify.response decoder set [] in
+        let* _queries = Arc.Verify.queries set in
+        let* decoder = Arc.Verify.response decoder [] in
         go decoder
-    | `Sets sets -> Fmt.pr ">>> %d set(s)\n%!" (List.length sets)
-    | `Malformed err -> failwith err in
-  go (Arc.Verify.decoder ())
+    | `Sets sets -> Ok sets
+    | `Malformed err -> Error (`Msg err) in
+  go (Arc.Verify.decoder ()) |> function
+  | Ok _ -> ()
+  | Error (`Msg msg) -> failwith msg

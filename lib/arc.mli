@@ -12,7 +12,12 @@ module Verify : sig
 
   val decoder : unit -> decoder
   val decode : decoder -> decode
-  val response : decoder -> t -> response list -> decoder
-  val queries : t -> query list
+
+  val response :
+       decoder
+    -> ([ `raw ] Domain_name.t * response) list
+    -> (decoder, [> `Msg of string ]) result
+
+  val queries : t -> ([ `raw ] Domain_name.t list, [> `Msg of string ]) result
   val src : decoder -> string -> int -> int -> decoder
 end
