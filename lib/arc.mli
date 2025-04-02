@@ -1,11 +1,14 @@
 type t
-type domain_key
+type domain_key = Dkim.domain_key
 
 module Verify : sig
   type decoder
 
   type decode =
-    [ `Await of decoder | `Query of t | `Sets of t list | `Malformed of string ]
+    [ `Await of decoder
+    | `Queries of decoder * t
+    | `Sets of t list
+    | `Malformed of string ]
 
   type response = [ `Expired | `Domain_key of domain_key | `DNS_error of string ]
   type query

@@ -2,7 +2,7 @@ let src = Logs.Src.create "arc"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-[@@@warning "-27-32"]
+[@@@warning "-27-30-32"]
 
 (* An ARC set *)
 type t = { results : results; msgsig : signature; seal : seal; uid : int }
@@ -13,8 +13,18 @@ and signature = {
   ; signature : Dkim.signed Dkim.t
 }
 
-and seal = Dkim.signed Dkim.t
-and results = Dmarc.Authentication_results.t
+and seal = {
+    field_name : Mrmime.Field_name.t
+  ; unstrctrd : Unstrctrd.t
+  ; seal : Dkim.signed Dkim.t
+}
+
+and results = {
+    field_name : Mrmime.Field_name.t
+  ; unstrctrd : Unstrctrd.t
+  ; results : Dmarc.Authentication_results.t
+}
+
 and domain_key = Dkim.domain_key
 
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
@@ -40,7 +50,7 @@ let p =
 
 module Field_name = Mrmime.Field_name
 
-let get_authentication_results unstrctrd :
+let get_authentication_results field_name unstrctrd :
     (int * results, [> `Msg of string ]) result =
   let open Angstrom in
   let p = Dmarc.Authentication_results.Decoder.authres_payload in
@@ -62,7 +72,7 @@ let get_authentication_results unstrctrd :
   let* v = Unstrctrd.without_comments v in
   let str = Unstrctrd.to_utf_8_string v in
   match Angstrom.parse_string ~consume:All p str with
-  | Ok _ as results -> results
+  | Ok (uid, results) -> Ok (uid, { field_name; unstrctrd; results })
   | Error _ -> error_msgf "Invalid ARC-Authentication-Results value"
 
 let field_arc_message_signature = Field_name.v "ARC-Message-Signature"
@@ -110,7 +120,10 @@ module Verify = struct
   }
 
   and decode =
-    [ `Await of decoder | `Query of t | `Sets of t list | `Malformed of string ]
+    [ `Await of decoder
+    | `Queries of decoder * t
+    | `Sets of t list
+    | `Malformed of string ]
 
   and state =
     | Extraction of Mrmime.Hd.decoder * arc_field list * field list
@@ -120,7 +133,7 @@ module Verify = struct
   and arc_field =
     | Msgsig of int * signature
     | Results of int * results
-    | Seal of int * Dkim.signed Dkim.t
+    | Seal of int * seal
 
   and field = Mrmime.Field_name.t * Unstrctrd.t
   and ctx = Ctx : { bh : string; b : 'k Dkim.Digest.value } -> ctx
@@ -173,9 +186,59 @@ module Verify = struct
         Mrmime.Hd.src v src idx len ;
         if len == 0 then end_of_input decoder else decoder
     | Queries _ -> assert false
-    | Body _ -> assert false
+    | Body (v, _) ->
+        Dkim.Body.src v input idx len ;
+        if len == 0 then end_of_input decoder else decoder
 
   let src_rem decoder = decoder.input_len - decoder.input_pos + 1
+
+  let signatures ctxs =
+    let fn (Ctx { bh; b = (dkim, dk, _) as value }) =
+      let b, bh_ok = Dkim.Digest.verify ~fields:bh value in
+      Log.debug (fun m -> m "bh is ok? %b" bh_ok) ;
+      Log.debug (fun m -> m "b: %s" (Base64.encode_exn b)) ;
+      () in
+    List.iter fn ctxs
+
+  let hashp : type a. a Digestif.hash -> Digestif.hash' -> bool =
+   fun a b ->
+    let a = Digestif.hash_to_hash' a in
+    a = b
+
+  let digest_sets sets =
+    let fn set =
+      let (Hash_algorithm a) = Dkim.hash_algorithm (fst set.seal).seal in
+      let module Hash = (val Digestif.module_of a) in
+      let feed_string ctx str = Hash.feed_string ctx str in
+      let canon0 = Dkim.Canon.of_fields (fst set.seal).seal in
+      let canon1 = Dkim.Canon.of_dkim_fields (fst set.seal).seal in
+      let ctx = Hash.empty in
+      let ctx =
+        canon0 set.results.field_name set.results.unstrctrd feed_string ctx
+      in
+      let ctx =
+        canon0 (fst set.msgsig).field_name (fst set.msgsig).unstrctrd
+          feed_string ctx in
+      let ctx =
+        canon1 (fst set.seal).field_name (fst set.seal).unstrctrd feed_string
+          ctx in
+      let hash = Hash.get ctx in
+      let msg = Hash.to_raw_string hash in
+      let hashp = hashp a in
+      let signature, _ = Dkim.signature_and_hash (fst set.seal).seal in
+      let pk = Dkim.public_key (snd set.seal) in
+      let alg = Dkim.algorithm (fst set.seal).seal in
+      let seal_is_ok =
+        match (X509.Public_key.decode_der pk, alg) with
+        | Ok (`RSA key), `RSA ->
+            Mirage_crypto_pk.Rsa.PKCS1.verify ~hashp ~key ~signature
+              (`Digest msg)
+        | Ok (`ED25519 key), `Ed25519 ->
+            Mirage_crypto_ec.Ed25519.verify ~key signature ~msg
+        | _ -> false in
+      Log.debug (fun m -> m "seal is ok: %b" seal_is_ok) ;
+      () in
+    List.iter fn sets
 
   (* extract ARC sets *)
   let rec extract t decoder arc_fields fields =
@@ -200,15 +263,22 @@ module Verify = struct
           then (
             let unstrctrd = get_unstrctrd_exn w v in
             match get_signature unstrctrd with
-            | Ok (uid, dkim) -> go (Seal (uid, dkim) :: arc_fields) fields
+            | Ok (uid, seal) ->
+                (* NOTE(dinosaure): the default canonicalization of DKIM is
+                   [`Simple] but [`Relaxed] must be used for ARC. *)
+                let seal =
+                  Dkim.with_canonicalization seal (`Relaxed, `Relaxed) in
+                let seal = { field_name = fn; unstrctrd; seal } in
+                go (Seal (uid, seal) :: arc_fields) fields
             | Error (`Msg msg) ->
                 Log.warn (fun m -> m "Ignoring a malformed ARC-Seal: %s" msg) ;
                 go arc_fields fields)
           else if is_arc_authentication_results fn
           then (
             let unstrctrd = get_unstrctrd_exn w v in
-            match get_authentication_results unstrctrd with
-            | Ok (uid, t) -> go (Results (uid, t) :: arc_fields) fields
+            match get_authentication_results fn unstrctrd with
+            | Ok (uid, t) ->
+                go (Results (uid, t) :: arc_fields) ((fn, unstrctrd) :: fields)
             | Error (`Msg _) ->
                 Log.warn (fun m ->
                     m "Ignoring a malformed ARC-Authentication-Results") ;
@@ -255,13 +325,14 @@ module Verify = struct
           let v = (msgsig.field_name, msgsig.unstrctrd, msgsig.signature, dk) in
           let bh, Dkim.Digest.Value b = Dkim.Digest.digest_fields others v in
           Ctx { bh; b } in
+        digest_sets sets ;
         let ctxs = List.map fn sets in
         let decoder = Dkim.Body.decoder () in
         if Bytes.length prelude > 0
         then Dkim.Body.src decoder prelude 0 (Bytes.length prelude) ;
         let state = Body (decoder, ctxs) in
         decode { t with state }
-    | set :: todo -> `Query set
+    | set :: todo -> `Queries (t, set)
 
   and digest t decoder ctxs =
     let rec go stack results =
@@ -282,18 +353,21 @@ module Verify = struct
           let rem = src_rem t in
           let input_pos = t.input_pos + rem in
           `Await { t with state; input_pos }
-      | `End -> assert false in
+      | `End ->
+          signatures ctxs ;
+          assert false in
     go [] ctxs
 
   and decode t =
     match t.state with
     | Extraction (decoder, arc_fields, fields) ->
         extract t decoder arc_fields fields
-    | Queries _ -> assert false
-    | Body _ -> assert false
+    | Queries (prelude, others, todo, sets) ->
+        queries t prelude others todo sets
+    | Body (decoder, ctxs) -> digest t decoder ctxs
 
   let queries (set : t) =
-    let seal = Dkim.Verify.domain_key set.seal
+    let seal = Dkim.Verify.domain_key set.seal.seal
     and msgsig = Dkim.Verify.domain_key set.msgsig.signature in
     match (seal, msgsig) with
     | Ok seal, Ok msgsig ->
@@ -305,7 +379,7 @@ module Verify = struct
   let response decoder responses =
     match decoder.state with
     | Queries (prelude, others, set :: todo, sets) -> (
-        let seal = Result.get_ok (Dkim.Verify.domain_key set.seal) in
+        let seal = Result.get_ok (Dkim.Verify.domain_key set.seal.seal) in
         let msgsig =
           Result.get_ok (Dkim.Verify.domain_key set.msgsig.signature) in
         if Domain_name.equal seal msgsig
@@ -345,5 +419,7 @@ module Verify = struct
               let state = Queries (prelude, others, todo, sets) in
               Ok { decoder with state }
           | _ -> error_msgf "Missing domain-key from the current ARC-set")
+    | Queries (_, _, [], _) ->
+        error_msgf "Invalid decoder state: no current ARC-set"
     | _ -> error_msgf "Invalid decoder state"
 end
