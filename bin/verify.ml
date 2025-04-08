@@ -39,12 +39,44 @@ let dns_queries t dns =
 
 let rec pp ppf = function
   | Arc.Verify.Nil -> Fmt.pf ppf "sender"
-  | Valid (t, chain) ->
-      let domain_name = Arc.domain t in
-      Fmt.pf ppf "%a -✓-> %a" pp chain Domain_name.pp domain_name
-  | Broken (t, chain) ->
-      let domain_name = Arc.domain t in
-      Fmt.pf ppf "%a -⨯-> %a" pp chain Domain_name.pp domain_name
+  | Valid { set; next; _ } ->
+      let domain_name = Arc.domain set in
+      let uid = Arc.uid set in
+      Fmt.pf ppf "%a -✓-> [%02d]%a" pp next uid Domain_name.pp domain_name
+  | Broken (set, next) ->
+      let domain_name = Arc.domain set in
+      let uid = Arc.uid set in
+      Fmt.pf ppf "%a -⨯-> [%02d]%a" pp next uid Domain_name.pp domain_name
+
+let rec collect ?prev setters = function
+  | Arc.Verify.Nil -> setters
+  | Valid { fields = `Intact; body = `Intact; set; next } ->
+      collect ~prev:set setters next
+  | Valid { fields = `Changed; body = `Intact; set; next } ->
+      let prev = Option.get prev in
+      let domain_name = Arc.domain prev in
+      let uid = Arc.uid prev in
+      collect ~prev:set (`Fields (uid, domain_name) :: setters) next
+  | Valid { fields = `Intact; body = `Changed; set; next } ->
+      let prev = Option.get prev in
+      let domain_name = Arc.domain prev in
+      let uid = Arc.uid prev in
+      collect ~prev:set (`Body (uid, domain_name) :: setters) next
+  | Valid { fields = `Changed; body = `Changed; set; next } ->
+      let prev = Option.get prev in
+      let domain_name = Arc.domain prev in
+      let uid = Arc.uid prev in
+      collect ~prev:set
+        (`Fields (uid, domain_name) :: `Body (uid, domain_name) :: setters)
+        next
+  | Broken (set, next) -> collect ~prev:set setters next
+
+let show_setter = function
+  | `Fields (uid, domain_name) ->
+      Fmt.pr "[%02d]%a has changed fields\n%!" uid Domain_name.pp domain_name
+  | `Body (uid, domain_name) ->
+      Fmt.pr "[%02d]%a has modified the content\n%!" uid Domain_name.pp
+        domain_name
 
 let () =
   let buf = Bytes.create 0x7ff in
@@ -69,5 +101,8 @@ let () =
     | `Chain chain -> Ok chain
     | `Malformed err -> Error (`Msg err) in
   go (Arc.Verify.decoder ()) |> function
-  | Ok chain -> Fmt.pr "%a\n%!" pp chain
+  | Ok chain ->
+      Fmt.pr "%a\n%!" pp chain ;
+      let setters = collect [] chain in
+      List.iter show_setter setters
   | Error (`Msg msg) -> failwith msg

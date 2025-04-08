@@ -2,13 +2,20 @@ type t
 type domain_key = Dkim.domain_key
 
 val domain : t -> [ `raw ] Domain_name.t
+val uid : t -> int
 
 module Verify : sig
   type decoder
 
   type chain = private
     | Nil : chain
-    | Valid : t * chain -> chain
+    | Valid : {
+          fields : [ `Intact | `Changed ]
+        ; body : [ `Intact | `Changed ]
+        ; set : t
+        ; next : chain
+      }
+        -> chain
     | Broken : t * chain -> chain
 
   type decode =

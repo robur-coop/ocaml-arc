@@ -31,6 +31,7 @@ and domain_key = Dkim.domain_key
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
 let domain { seal; _ } = Dkim.domain seal.seal
+let uid { uid; _ } = uid
 
 let p =
   let open Mrmime in
@@ -163,7 +164,13 @@ module Verify = struct
 
   and chain =
     | Nil : chain
-    | Valid : t * chain -> chain
+    | Valid : {
+          fields : [ `Intact | `Changed ]
+        ; body : [ `Intact | `Changed ]
+        ; set : t
+        ; next : chain
+      }
+        -> chain
     | Broken : t * chain -> chain
 
   let pp_field ppf = function
@@ -296,11 +303,13 @@ module Verify = struct
         } in
       match cv with
       | (`Pass | `None) when seal_ok ->
-          let last = set.uid = max in
+          let fields = if bh_ok then `Intact else `Changed in
+          let body = if b_ok then `Intact else `Changed in
+          let last = Int.equal set.uid max in
           if last && b_ok && bh_ok
-          then Valid (set, chain)
+          then Valid { fields; body; set; next = chain }
           else if not last
-          then Valid (set, chain)
+          then Valid { fields; body; set; next = chain }
           else Broken (set, chain)
       | _ -> Broken (set, chain) in
     List.fold_left fn Nil ctxs

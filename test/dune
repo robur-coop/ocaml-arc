@@ -1,0 +1,11 @@
+(executable
+ (name test)
+ (libraries arc alcotest))
+
+(rule
+ (alias runtest)
+ (deps
+  (:test test.exe)
+  (glob_files raw/*.mail))
+ (action
+  (run %{test} --color=always)))
