@@ -1,17 +1,23 @@
 type t
 type domain_key = Dkim.domain_key
 
+val domain : t -> [ `raw ] Domain_name.t
+
 module Verify : sig
   type decoder
+
+  type chain = private
+    | Nil : chain
+    | Valid : t * chain -> chain
+    | Broken : t * chain -> chain
 
   type decode =
     [ `Await of decoder
     | `Queries of decoder * t
-    | `Sets of t list
+    | `Chain of chain
     | `Malformed of string ]
 
   type response = [ `Expired | `Domain_key of domain_key | `DNS_error of string ]
-  type query
 
   val decoder : unit -> decoder
   val decode : decoder -> decode

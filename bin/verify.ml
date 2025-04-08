@@ -37,6 +37,15 @@ let dns_queries t dns =
     (dn, response) in
   List.map fn dns
 
+let rec pp ppf = function
+  | Arc.Verify.Nil -> Fmt.pf ppf "sender"
+  | Valid (t, chain) ->
+      let domain_name = Arc.domain t in
+      Fmt.pf ppf "%a -✓-> %a" pp chain Domain_name.pp domain_name
+  | Broken (t, chain) ->
+      let domain_name = Arc.domain t in
+      Fmt.pf ppf "%a -⨯-> %a" pp chain Domain_name.pp domain_name
+
 let () =
   let buf = Bytes.create 0x7ff in
   let dns = Dns_client_unix.create () in
@@ -57,8 +66,8 @@ let () =
         let responses = dns_queries dns queries in
         let* decoder = Arc.Verify.response decoder responses in
         go decoder
-    | `Sets sets -> Ok sets
+    | `Chain chain -> Ok chain
     | `Malformed err -> Error (`Msg err) in
   go (Arc.Verify.decoder ()) |> function
-  | Ok _ -> ()
+  | Ok chain -> Fmt.pr "%a\n%!" pp chain
   | Error (`Msg msg) -> failwith msg

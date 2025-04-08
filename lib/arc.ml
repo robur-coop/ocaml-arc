@@ -30,6 +30,7 @@ and domain_key = Dkim.domain_key
 
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
+let domain { seal; _ } = Dkim.domain seal.seal
 
 let p =
   let open Mrmime in
@@ -127,7 +128,7 @@ module Verify = struct
   and decode =
     [ `Await of decoder
     | `Queries of decoder * t
-    | `Sets of t list
+    | `Chain of chain
     | `Malformed of string ]
 
   and state =
@@ -141,8 +142,16 @@ module Verify = struct
     | Seal of int * seal
 
   and field = Mrmime.Field_name.t * Unstrctrd.t
-  and ctx = Ctx : { uid : int; bh : string; b : 'k Dkim.Digest.value } -> ctx
-  and query = |
+
+  and ctx =
+    | Ctx : {
+          bh : string
+        ; b : 'k Dkim.Digest.value
+        ; set_and_dk : set_and_dk
+        ; cv : [ `None | `Fail | `Pass ]
+      }
+        -> ctx
+
   and response = [ `Expired | `Domain_key of domain_key | `DNS_error of string ]
 
   and set_and_dk = {
@@ -151,6 +160,11 @@ module Verify = struct
     ; seal : seal * Dkim.domain_key
     ; uid : int
   }
+
+  and chain =
+    | Nil : chain
+    | Valid : t * chain -> chain
+    | Broken : t * chain -> chain
 
   let pp_field ppf = function
     | Msgsig _ -> Fmt.string ppf "Message-Signature"
@@ -197,45 +211,52 @@ module Verify = struct
 
   let src_rem decoder = decoder.input_len - decoder.input_pos + 1
 
+  (*
   let signatures ctxs =
-    let fn (Ctx { uid; bh; b = (dkim, dk, _) as value }) =
+    let fn (Ctx { bh; b = (dkim, dk, _) as value; set_and_dk; cv; }) =
       let b, bh_ok = Dkim.Digest.verify ~fields:bh value in
-      Log.debug (fun m -> m "[%02d] bh is ok? %b" uid bh_ok) ;
-      Log.debug (fun m -> m "[%02d] b: %s" uid (Base64.encode_exn b)) ;
       let _, Dkim.Hash_value (k, b') = Dkim.signature_and_hash dkim in
       let b' = Digestif.to_raw_string k b' in
+      let b_ok = Eqaf.equal b b' in
+      let uid = set_and_dk.uid in
       Log.debug (fun m -> m "[%02d] b (expect): %s" uid (Base64.encode_exn b')) ;
       () in
     List.iter fn ctxs
+  *)
 
   let hashp : type a. a Digestif.hash -> Digestif.hash' -> bool =
    fun a b ->
     let a = Digestif.hash_to_hash' a in
     a = b
 
-  let digest_sets sets =
-    let fn set =
+  let with_set ~canon ~feed_string ctx cur =
+    let field_name = cur.results.field_name in
+    let unstrctrd = cur.results.unstrctrd in
+    let ctx = canon field_name unstrctrd feed_string ctx in
+    let field_name = (fst cur.msgsig).field_name in
+    let unstrctrd = (fst cur.msgsig).unstrctrd in
+    let ctx = canon field_name unstrctrd feed_string ctx in
+    let field_name = (fst cur.seal).field_name in
+    let unstrctrd = (fst cur.seal).unstrctrd in
+    canon field_name unstrctrd feed_string ctx
+
+  let verify ctxs =
+    let fn (Ctx { set_and_dk; _ }) = set_and_dk in
+    let sets = List.map fn ctxs in
+    let max = List.length sets in
+    let fn chain (Ctx { bh; b = (dkim, _, _) as value; set_and_dk = set; cv }) =
       let (Hash_algorithm a) = Dkim.hash_algorithm (fst set.seal).seal in
       let module Hash = (val Digestif.module_of a) in
       let feed_string ctx str = Hash.feed_string ctx str in
       let canon0 = Dkim.Canon.of_fields (fst set.seal).seal in
       let canon1 = Dkim.Canon.of_dkim_fields (fst set.seal).seal in
-      let with_set ctx cur =
-        let field_name = cur.results.field_name in
-        let unstrctrd = cur.results.unstrctrd in
-        let ctx = canon0 field_name unstrctrd feed_string ctx in
-        let field_name = (fst cur.msgsig).field_name in
-        let unstrctrd = (fst cur.msgsig).unstrctrd in
-        let ctx = canon0 field_name unstrctrd feed_string ctx in
-        let field_name = (fst cur.seal).field_name in
-        let unstrctrd = (fst cur.seal).unstrctrd in
-        let ctx = canon0 field_name unstrctrd feed_string ctx in
-        ctx in
-      let sets = List.filter (fun set' -> set'.uid < set.uid) sets in
       let ctx =
-        match Dkim.get_key "cv" (fst set.seal).map with
-        | Some "fail" -> Hash.empty
-        | _ -> List.fold_left with_set Hash.empty sets in
+        match cv with
+        | `None | `Fail -> Hash.empty
+        | `Pass ->
+            let older = List.filter (fun set' -> set'.uid < set.uid) sets in
+            let fn = with_set ~canon:canon0 ~feed_string in
+            List.fold_left fn Hash.empty older in
       let field_name = set.results.field_name in
       let unstrctrd = set.results.unstrctrd in
       let ctx = canon0 field_name unstrctrd feed_string ctx in
@@ -251,7 +272,7 @@ module Verify = struct
       let signature, _ = Dkim.signature_and_hash (fst set.seal).seal in
       let pk = Dkim.public_key (snd set.seal) in
       let alg = Dkim.algorithm (fst set.seal).seal in
-      let seal_is_ok =
+      let seal_ok =
         match (X509.Public_key.decode_der pk, alg) with
         | Ok (`RSA key), `RSA ->
             Mirage_crypto_pk.Rsa.PKCS1.verify ~hashp ~key ~signature
@@ -259,9 +280,30 @@ module Verify = struct
         | Ok (`ED25519 key), `Ed25519 ->
             Mirage_crypto_ec.Ed25519.verify ~key signature ~msg
         | _ -> false in
-      Log.debug (fun m -> m "[%02d] seal is ok: %b" set.uid seal_is_ok) ;
-      () in
-    List.iter fn sets
+      let b, bh_ok = Dkim.Digest.verify ~fields:bh value in
+      let _, Dkim.Hash_value (k, b') = Dkim.signature_and_hash dkim in
+      let b' = Digestif.to_raw_string k b' in
+      let b_ok = Eqaf.equal b b' in
+      Log.debug (fun m -> m "[%02d] seal is ok? %b" set.uid seal_ok) ;
+      Log.debug (fun m -> m "[%02d] bh is ok? %b" set.uid bh_ok) ;
+      Log.debug (fun m -> m "[%02d] b is ok? %b" set.uid b_ok) ;
+      let set : t =
+        {
+          results = set.results
+        ; msgsig = fst set.msgsig
+        ; seal = fst set.seal
+        ; uid = set.uid
+        } in
+      match cv with
+      | (`Pass | `None) when seal_ok ->
+          let last = set.uid = max in
+          if last && b_ok && bh_ok
+          then Valid (set, chain)
+          else if not last
+          then Valid (set, chain)
+          else Broken (set, chain)
+      | _ -> Broken (set, chain) in
+    List.fold_left fn Nil ctxs
 
   (* extract ARC sets *)
   let rec extract t decoder arc_fields fields =
@@ -343,12 +385,22 @@ module Verify = struct
     match todo with
     | [] ->
         let prelude = Bytes.unsafe_of_string prelude in
-        let fn set =
-          let msgsig, dk = set.msgsig in
+        let fn set_and_dk =
+          let msgsig, dk = set_and_dk.msgsig in
           let v = (msgsig.field_name, msgsig.unstrctrd, msgsig.signature, dk) in
           let bh, Dkim.Digest.Value b = Dkim.Digest.digest_fields others v in
-          Ctx { uid = set.uid; bh; b } in
-        digest_sets sets ;
+          let seal, _ = set_and_dk.seal in
+          let cv =
+            match
+              Option.map String.lowercase_ascii (Dkim.get_key "cv" seal.map)
+            with
+            | Some "none" | None -> `None
+            | Some "fail" -> `Fail
+            | Some "pass" -> `Pass
+            | Some _ -> failwith "Invalid cv value"
+            (* TODO *) in
+          Ctx { bh; b; set_and_dk; cv } in
+        (* digest_sets sets ; *)
         let ctxs = List.map fn sets in
         let decoder = Dkim.Body.decoder () in
         if Bytes.length prelude > 0
@@ -362,27 +414,30 @@ module Verify = struct
       match Dkim.Body.decode decoder with
       | (`Spaces _ | `CRLF) as x -> go (x :: stack) results
       | `Data x ->
-          let fn (Ctx { uid; bh; b }) =
-            Ctx { uid; bh; b = Dkim.Digest.digest_wsp (List.rev stack) b } in
+          let fn (Ctx { bh; b; set_and_dk; cv }) =
+            Ctx
+              {
+                bh
+              ; b = Dkim.Digest.digest_wsp (List.rev stack) b
+              ; set_and_dk
+              ; cv
+              } in
           let results = List.map fn results in
-          let fn (Ctx { uid; bh; b }) =
-            Ctx { uid; bh; b = Dkim.Digest.digest_str x b } in
+          let fn (Ctx { bh; b; set_and_dk; cv }) =
+            Ctx { bh; b = Dkim.Digest.digest_str x b; set_and_dk; cv } in
           let results = List.map fn results in
           go [] results
       | `Await ->
-          (* let fn (Ctx { uid; bh; b }) =
-            Ctx { uid; bh; b = Dkim.Digest.digest_wsp stack b } in
-          let results = List.map fn results in *)
           let state = Body (decoder, stack, results) in
           let rem = src_rem t in
           let input_pos = t.input_pos + rem in
           `Await { t with state; input_pos }
       | `End ->
-          let fn (Ctx { uid; bh; b }) =
-            Ctx { uid; bh; b = Dkim.Digest.digest_wsp [ `CRLF ] b } in
+          let fn (Ctx { bh; b; set_and_dk; cv }) =
+            Ctx { bh; b = Dkim.Digest.digest_wsp [ `CRLF ] b; set_and_dk; cv }
+          in
           let results = List.map fn results in
-          signatures results;
-          assert false in
+          `Chain (verify results) in
     go stack ctxs
 
   and decode t =
