@@ -17,6 +17,7 @@ and seal = {
     field_name : Mrmime.Field_name.t
   ; unstrctrd : Unstrctrd.t
   ; seal : Dkim.signed Dkim.t
+  ; map : Dkim.map
 }
 
 and results = {
@@ -65,15 +66,18 @@ let get_authentication_results field_name unstrctrd :
     *> ignore_spaces
     *> take_while1 is_digit
     >>= fun uid ->
-    ignore_spaces *> char ';' *> p >>= fun v -> return (int_of_string uid, v)
-  in
+    ignore_spaces *> char ';' >>= fun _ ->
+    p >>= fun v -> return (int_of_string uid, v) in
   let ( let* ) = Result.bind in
   let v = Unstrctrd.fold_fws unstrctrd in
   let* v = Unstrctrd.without_comments v in
   let str = Unstrctrd.to_utf_8_string v in
+  Log.debug (fun m -> m "ARC-Authentication-Results: %s" str) ;
   match Angstrom.parse_string ~consume:All p str with
   | Ok (uid, results) -> Ok (uid, { field_name; unstrctrd; results })
-  | Error _ -> error_msgf "Invalid ARC-Authentication-Results value"
+  | Error msg ->
+      Log.err (fun m -> m "Invalid ARC-Authentication-Results: %s" msg) ;
+      error_msgf "Invalid ARC-Authentication-Results value"
 
 let field_arc_message_signature = Field_name.v "ARC-Message-Signature"
 let field_arc_seal = Field_name.v "ARC-Seal"
@@ -99,7 +103,8 @@ let get_unstrctrd_exn : type a. a Mrmime.Field.t -> a -> Unstrctrd.t =
 (* should never appear *)
 
 let get_signature :
-    Unstrctrd.t -> (int * Dkim.signed Dkim.t, [> `Msg of string ]) result =
+       Unstrctrd.t
+    -> (int * Dkim.signed Dkim.t * Dkim.map, [> `Msg of string ]) result =
  fun unstrctrd ->
   let ( let* ) = Result.bind in
   let* m = Dkim.of_unstrctrd_to_map unstrctrd in
@@ -108,7 +113,7 @@ let get_signature :
   let* t = Dkim.map_to_t m in
   try
     let i = int_of_string i in
-    Ok (i, t)
+    Ok (i, t, m)
   with _exn -> error_msgf "Invalid Agent or User Identifier"
 
 module Verify = struct
@@ -128,7 +133,7 @@ module Verify = struct
   and state =
     | Extraction of Mrmime.Hd.decoder * arc_field list * field list
     | Queries of string * field list * t list * set_and_dk list
-    | Body of Dkim.Body.decoder * ctx list
+    | Body of Dkim.Body.decoder * [ `CRLF | `Spaces of string ] list * ctx list
 
   and arc_field =
     | Msgsig of int * signature
@@ -136,7 +141,7 @@ module Verify = struct
     | Seal of int * seal
 
   and field = Mrmime.Field_name.t * Unstrctrd.t
-  and ctx = Ctx : { bh : string; b : 'k Dkim.Digest.value } -> ctx
+  and ctx = Ctx : { uid : int; bh : string; b : 'k Dkim.Digest.value } -> ctx
   and query = |
   and response = [ `Expired | `Domain_key of domain_key | `DNS_error of string ]
 
@@ -186,17 +191,20 @@ module Verify = struct
         Mrmime.Hd.src v src idx len ;
         if len == 0 then end_of_input decoder else decoder
     | Queries _ -> assert false
-    | Body (v, _) ->
+    | Body (v, _, _) ->
         Dkim.Body.src v input idx len ;
         if len == 0 then end_of_input decoder else decoder
 
   let src_rem decoder = decoder.input_len - decoder.input_pos + 1
 
   let signatures ctxs =
-    let fn (Ctx { bh; b = (dkim, dk, _) as value }) =
+    let fn (Ctx { uid; bh; b = (dkim, dk, _) as value }) =
       let b, bh_ok = Dkim.Digest.verify ~fields:bh value in
-      Log.debug (fun m -> m "bh is ok? %b" bh_ok) ;
-      Log.debug (fun m -> m "b: %s" (Base64.encode_exn b)) ;
+      Log.debug (fun m -> m "[%02d] bh is ok? %b" uid bh_ok) ;
+      Log.debug (fun m -> m "[%02d] b: %s" uid (Base64.encode_exn b)) ;
+      let _, Dkim.Hash_value (k, b') = Dkim.signature_and_hash dkim in
+      let b' = Digestif.to_raw_string k b' in
+      Log.debug (fun m -> m "[%02d] b (expect): %s" uid (Base64.encode_exn b')) ;
       () in
     List.iter fn ctxs
 
@@ -212,16 +220,31 @@ module Verify = struct
       let feed_string ctx str = Hash.feed_string ctx str in
       let canon0 = Dkim.Canon.of_fields (fst set.seal).seal in
       let canon1 = Dkim.Canon.of_dkim_fields (fst set.seal).seal in
-      let ctx = Hash.empty in
+      let with_set ctx cur =
+        let field_name = cur.results.field_name in
+        let unstrctrd = cur.results.unstrctrd in
+        let ctx = canon0 field_name unstrctrd feed_string ctx in
+        let field_name = (fst cur.msgsig).field_name in
+        let unstrctrd = (fst cur.msgsig).unstrctrd in
+        let ctx = canon0 field_name unstrctrd feed_string ctx in
+        let field_name = (fst cur.seal).field_name in
+        let unstrctrd = (fst cur.seal).unstrctrd in
+        let ctx = canon0 field_name unstrctrd feed_string ctx in
+        ctx in
+      let sets = List.filter (fun set' -> set'.uid < set.uid) sets in
       let ctx =
-        canon0 set.results.field_name set.results.unstrctrd feed_string ctx
-      in
-      let ctx =
-        canon0 (fst set.msgsig).field_name (fst set.msgsig).unstrctrd
-          feed_string ctx in
-      let ctx =
-        canon1 (fst set.seal).field_name (fst set.seal).unstrctrd feed_string
-          ctx in
+        match Dkim.get_key "cv" (fst set.seal).map with
+        | Some "fail" -> Hash.empty
+        | _ -> List.fold_left with_set Hash.empty sets in
+      let field_name = set.results.field_name in
+      let unstrctrd = set.results.unstrctrd in
+      let ctx = canon0 field_name unstrctrd feed_string ctx in
+      let field_name = (fst set.msgsig).field_name in
+      let unstrctrd = (fst set.msgsig).unstrctrd in
+      let ctx = canon0 field_name unstrctrd feed_string ctx in
+      let field_name = (fst set.seal).field_name in
+      let unstrctrd = (fst set.seal).unstrctrd in
+      let ctx = canon1 field_name unstrctrd feed_string ctx in
       let hash = Hash.get ctx in
       let msg = Hash.to_raw_string hash in
       let hashp = hashp a in
@@ -236,7 +259,7 @@ module Verify = struct
         | Ok (`ED25519 key), `Ed25519 ->
             Mirage_crypto_ec.Ed25519.verify ~key signature ~msg
         | _ -> false in
-      Log.debug (fun m -> m "seal is ok: %b" seal_is_ok) ;
+      Log.debug (fun m -> m "[%02d] seal is ok: %b" set.uid seal_is_ok) ;
       () in
     List.iter fn sets
 
@@ -251,7 +274,7 @@ module Verify = struct
           then (
             let unstrctrd = get_unstrctrd_exn w v in
             match get_signature unstrctrd with
-            | Ok (uid, signature) ->
+            | Ok (uid, signature, _) ->
                 let field_name = fn in
                 let msgsig = { field_name; unstrctrd; signature } in
                 go (Msgsig (uid, msgsig) :: arc_fields) fields
@@ -263,12 +286,12 @@ module Verify = struct
           then (
             let unstrctrd = get_unstrctrd_exn w v in
             match get_signature unstrctrd with
-            | Ok (uid, seal) ->
+            | Ok (uid, seal, map) ->
                 (* NOTE(dinosaure): the default canonicalization of DKIM is
                    [`Simple] but [`Relaxed] must be used for ARC. *)
                 let seal =
                   Dkim.with_canonicalization seal (`Relaxed, `Relaxed) in
-                let seal = { field_name = fn; unstrctrd; seal } in
+                let seal = { field_name = fn; unstrctrd; seal; map } in
                 go (Seal (uid, seal) :: arc_fields) fields
             | Error (`Msg msg) ->
                 Log.warn (fun m -> m "Ignoring a malformed ARC-Seal: %s" msg) ;
@@ -324,39 +347,43 @@ module Verify = struct
           let msgsig, dk = set.msgsig in
           let v = (msgsig.field_name, msgsig.unstrctrd, msgsig.signature, dk) in
           let bh, Dkim.Digest.Value b = Dkim.Digest.digest_fields others v in
-          Ctx { bh; b } in
+          Ctx { uid = set.uid; bh; b } in
         digest_sets sets ;
         let ctxs = List.map fn sets in
         let decoder = Dkim.Body.decoder () in
         if Bytes.length prelude > 0
         then Dkim.Body.src decoder prelude 0 (Bytes.length prelude) ;
-        let state = Body (decoder, ctxs) in
+        let state = Body (decoder, [], ctxs) in
         decode { t with state }
     | set :: todo -> `Queries (t, set)
 
-  and digest t decoder ctxs =
+  and digest t decoder stack ctxs =
     let rec go stack results =
       match Dkim.Body.decode decoder with
       | (`Spaces _ | `CRLF) as x -> go (x :: stack) results
       | `Data x ->
-          let fn (Ctx { bh; b }) =
-            Ctx { bh; b = Dkim.Digest.digest_wsp (List.rev stack) b } in
+          let fn (Ctx { uid; bh; b }) =
+            Ctx { uid; bh; b = Dkim.Digest.digest_wsp (List.rev stack) b } in
           let results = List.map fn results in
-          let fn (Ctx { bh; b }) = Ctx { bh; b = Dkim.Digest.digest_str x b } in
+          let fn (Ctx { uid; bh; b }) =
+            Ctx { uid; bh; b = Dkim.Digest.digest_str x b } in
           let results = List.map fn results in
           go [] results
       | `Await ->
-          let fn (Ctx { bh; b }) =
-            Ctx { bh; b = Dkim.Digest.digest_wsp stack b } in
-          let results = List.map fn results in
-          let state = Body (decoder, results) in
+          (* let fn (Ctx { uid; bh; b }) =
+            Ctx { uid; bh; b = Dkim.Digest.digest_wsp stack b } in
+          let results = List.map fn results in *)
+          let state = Body (decoder, stack, results) in
           let rem = src_rem t in
           let input_pos = t.input_pos + rem in
           `Await { t with state; input_pos }
       | `End ->
-          signatures ctxs ;
+          let fn (Ctx { uid; bh; b }) =
+            Ctx { uid; bh; b = Dkim.Digest.digest_wsp [ `CRLF ] b } in
+          let results = List.map fn results in
+          signatures results;
           assert false in
-    go [] ctxs
+    go stack ctxs
 
   and decode t =
     match t.state with
@@ -364,7 +391,7 @@ module Verify = struct
         extract t decoder arc_fields fields
     | Queries (prelude, others, todo, sets) ->
         queries t prelude others todo sets
-    | Body (decoder, ctxs) -> digest t decoder ctxs
+    | Body (decoder, stack, ctxs) -> digest t decoder stack ctxs
 
   let queries (set : t) =
     let seal = Dkim.Verify.domain_key set.seal.seal

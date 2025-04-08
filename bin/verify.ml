@@ -46,8 +46,10 @@ let () =
     | `Await decoder ->
         let len = input stdin buf 0 (Bytes.length buf) in
         let str = Bytes.sub_string buf 0 len in
+        (*
         let str = String.split_on_char '\n' str in
         let str = String.concat "\r\n" str in
+        *)
         let decoder = Arc.Verify.src decoder str 0 (String.length str) in
         go decoder
     | `Queries (decoder, set) ->
