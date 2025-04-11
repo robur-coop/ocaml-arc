@@ -1,3 +1,4 @@
 (library
  (name arc)
+ (public_name arc)
  (libraries dmarc))

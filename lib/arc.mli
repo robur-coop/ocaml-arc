@@ -8,7 +8,7 @@ module Verify : sig
   type decoder
 
   type chain = private
-    | Nil : chain
+    | Nil : Emile.mailbox -> chain
     | Valid : {
           fields : [ `Intact | `Changed ]
         ; body : [ `Intact | `Changed ]

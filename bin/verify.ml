@@ -38,7 +38,7 @@ let dns_queries t dns =
   List.map fn dns
 
 let rec pp ppf = function
-  | Arc.Verify.Nil -> Fmt.pf ppf "sender"
+  | Arc.Verify.Nil m -> Fmt.pf ppf "%a" Emile.pp_mailbox m
   | Valid { set; next; _ } ->
       let domain_name = Arc.domain set in
       let uid = Arc.uid set in
@@ -49,7 +49,7 @@ let rec pp ppf = function
       Fmt.pf ppf "%a -⨯-> [%02d]%a" pp next uid Domain_name.pp domain_name
 
 let rec collect ?prev setters = function
-  | Arc.Verify.Nil -> setters
+  | Arc.Verify.Nil _ -> setters
   | Valid { fields = `Intact; body = `Intact; set; next } ->
       collect ~prev:set setters next
   | Valid { fields = `Changed; body = `Intact; set; next } ->

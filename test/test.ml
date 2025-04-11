@@ -29,8 +29,8 @@ let domain = Alcotest.testable Domain_name.pp Domain_name.equal
 
 let rec test chain expect =
   match (chain, expect) with
-  | Arc.Verify.Nil, _ :: _ -> Alcotest.failf "Empty chain"
-  | Arc.Verify.Nil, [] -> Alcotest.(check pass) "chain" () ()
+  | Arc.Verify.Nil _, _ :: _ -> Alcotest.failf "Empty chain"
+  | Arc.Verify.Nil _, [] -> Alcotest.(check pass) "chain" () ()
   | _, [] -> Alcotest.failf "Longer chain"
   | Valid { set; next; _ }, `Valid dn :: expect ->
       let dn' = Arc.domain set in

@@ -86,6 +86,7 @@ let field_arc_seal = Field_name.v "ARC-Seal"
 let field_arc_authentication_results = Field_name.v "ARC-Authentication-Results"
 let is_arc_message_signature = Field_name.equal field_arc_message_signature
 let is_arc_seal = Field_name.equal field_arc_seal
+let is_from = Field_name.equal Mrmime.Field_name.from
 
 let is_arc_authentication_results =
   Field_name.equal field_arc_authentication_results
@@ -124,6 +125,7 @@ module Verify = struct
     ; input_pos : int
     ; input_len : int
     ; state : state
+    ; mutable sender : Emile.mailbox option
   }
 
   and decode =
@@ -163,7 +165,7 @@ module Verify = struct
   }
 
   and chain =
-    | Nil : chain
+    | Nil : Emile.mailbox -> chain
     | Valid : {
           fields : [ `Intact | `Changed ]
         ; body : [ `Intact | `Changed ]
@@ -195,7 +197,7 @@ module Verify = struct
     let input, input_pos, input_len = (Bytes.empty, 1, 0) in
     let dec = Mrmime.Hd.decoder p in
     let state = Extraction (dec, [], []) in
-    { input; input_pos; input_len; state }
+    { input; input_pos; input_len; state; sender = None }
 
   let end_of_input decoder =
     { decoder with input = Bytes.empty; input_pos = 0; input_len = min_int }
@@ -218,19 +220,6 @@ module Verify = struct
 
   let src_rem decoder = decoder.input_len - decoder.input_pos + 1
 
-  (*
-  let signatures ctxs =
-    let fn (Ctx { bh; b = (dkim, dk, _) as value; set_and_dk; cv; }) =
-      let b, bh_ok = Dkim.Digest.verify ~fields:bh value in
-      let _, Dkim.Hash_value (k, b') = Dkim.signature_and_hash dkim in
-      let b' = Digestif.to_raw_string k b' in
-      let b_ok = Eqaf.equal b b' in
-      let uid = set_and_dk.uid in
-      Log.debug (fun m -> m "[%02d] b (expect): %s" uid (Base64.encode_exn b')) ;
-      () in
-    List.iter fn ctxs
-  *)
-
   let hashp : type a. a Digestif.hash -> Digestif.hash' -> bool =
    fun a b ->
     let a = Digestif.hash_to_hash' a in
@@ -247,7 +236,7 @@ module Verify = struct
     let unstrctrd = (fst cur.seal).unstrctrd in
     canon field_name unstrctrd feed_string ctx
 
-  let verify ctxs =
+  let verify sender ctxs =
     let fn (Ctx { set_and_dk; _ }) = set_and_dk in
     let sets = List.map fn ctxs in
     let max = List.length sets in
@@ -312,7 +301,7 @@ module Verify = struct
           then Valid { fields; body; set; next = chain }
           else Broken (set, chain)
       | _ -> Broken (set, chain) in
-    List.fold_left fn Nil ctxs
+    List.fold_left fn (Nil sender) ctxs
 
   (* extract ARC sets *)
   let rec extract t decoder arc_fields fields =
@@ -357,6 +346,16 @@ module Verify = struct
                 Log.warn (fun m ->
                     m "Ignoring a malformed ARC-Authentication-Results") ;
                 go arc_fields fields)
+          else if is_from fn
+          then
+            let unstrctrd = get_unstrctrd_exn w v in
+            let str = Unstrctrd.to_utf_8_string unstrctrd in
+            match Emile.of_string str with
+            | Ok mailbox ->
+                t.sender <- Some mailbox ;
+                let field = (fn, unstrctrd) in
+                go arc_fields (field :: fields)
+            | Error _ -> `Malformed "Invalid From: value"
           else
             let unstrctrd = get_unstrctrd_exn w v in
             let field = (fn, unstrctrd) in
@@ -441,12 +440,14 @@ module Verify = struct
           let rem = src_rem t in
           let input_pos = t.input_pos + rem in
           `Await { t with state; input_pos }
-      | `End ->
+      | `End -> (
           let fn (Ctx { bh; b; set_and_dk; cv }) =
             Ctx { bh; b = Dkim.Digest.digest_wsp [ `CRLF ] b; set_and_dk; cv }
           in
           let results = List.map fn results in
-          `Chain (verify results) in
+          match t.sender with
+          | None -> `Malformed "From: field not found"
+          | Some sender -> `Chain (verify sender results)) in
     go stack ctxs
 
   and decode t =
