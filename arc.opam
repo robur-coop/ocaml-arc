@@ -11,7 +11,9 @@ bug-reports: "https://git.robur.coop/robur/ocaml-arc"
 dev-repo: "git+https://github.com/robur-coop/ocaml-arc.git"
 depends: [
   "ocaml" {>= "4.08.0"}
+  "dune" {>= "2.0.0"}
   "dmarc"
+  "alcotest" {with-test}
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]
