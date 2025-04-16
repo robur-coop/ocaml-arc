@@ -652,6 +652,20 @@ module Sign = struct
         Dkim.Body.src v input idx len ;
         if len == 0 then end_of_input decoder else decoder
 
+  let field_and_value =
+    let open Angstrom in
+    let open Mrmime in
+    let buf = Bytes.create 0x7f in
+    let is_wsp = function ' ' | '\t' -> true | _ -> false in
+    Field_name.Decoder.field_name >>= fun field_name ->
+    skip_while is_wsp *> char ':' *> Unstrctrd_parser.unstrctrd buf
+    >>| fun value -> (field_name, value)
+
+  let raw encoder value =
+    let str = Prettym.to_string ~new_line:"\r\n" encoder value in
+    let v = Angstrom.parse_string ~consume:All field_and_value str in
+    Result.get_ok v
+
   let bbh_of_msgsig : type k0 k1.
          signer
       -> fields:(Dkim.unsigned, k0) Dkim.Digest.value
@@ -664,10 +678,7 @@ module Sign = struct
       Dkim.Hash_value
         (k, Digestif.of_raw_string k Hash.(to_raw_string (get ctx))) in
     let fake = Dkim.with_signature_and_hash (snd t.msgsig) ("", bh) in
-    let fake = Prettym.to_string ~new_line:"\r\n" Dkim.Encoder.as_field fake in
-    let unstrctrd =
-      Angstrom.parse_string ~consume:All Dkim.dkim_field_and_value fake in
-    let unstrctrd = Result.get_ok unstrctrd in
+    let field_name, unstrctrd = raw Dkim.Encoder.as_field fake in
     let _, Dkim.Digest.Digest { m = (module Hash); ctx } = fields in
     let feed_string str ctx = Hash.feed_string str ctx in
     let canon = Dkim.Canon.of_dkim_fields in
@@ -691,20 +702,6 @@ module Sign = struct
       | Verify.Valid { set; next; _ } -> go (set :: acc) next
       | Verify.Broken _ -> List.rev acc in
     go [] t.chain
-
-  let field_and_value =
-    let open Angstrom in
-    let open Mrmime in
-    let buf = Bytes.create 0x7f in
-    let is_wsp = function ' ' | '\t' -> true | _ -> false in
-    Field_name.Decoder.field_name >>= fun field_name ->
-    skip_while is_wsp *> char ':' *> Unstrctrd_parser.unstrctrd buf
-    >>| fun value -> (field_name, value)
-
-  let raw encoder value =
-    let str = Prettym.to_string ~new_line:"\r\n" encoder value in
-    let v = Angstrom.parse_string ~consume:All field_and_value str in
-    Result.get_ok v
 
   let bh_of_seal t bbh =
     let uid = Verify.length t.chain + 1 in
