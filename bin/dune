@@ -1,3 +1,7 @@
 (executable
  (name verify)
  (libraries dns-client.unix logs.fmt fmt.tty arc))
+
+(executable
+ (name sign)
+ (libraries hxd.core hxd.string fmt.tty logs.fmt logs.threaded cmdliner miou.unix dns-client-miou-unix mirage-crypto-rng-miou-unix fpath arc))

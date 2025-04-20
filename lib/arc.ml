@@ -184,6 +184,11 @@ module Verify = struct
     | Nil _ -> 0
     | Valid { next; _ } | Broken (_, next) -> 1 + length next
 
+  let rec is_valid_chain = function
+    | Nil _ -> true
+    | Valid { next; _ } -> is_valid_chain next && true
+    | Broken _ -> false
+
   let compare_arc_field a b =
     match (a, b) with
     | ( (Results (a, _) | Msgsig (a, _) | Seal (a, _))
@@ -283,7 +288,7 @@ module Verify = struct
         | Ok (`RSA key), `RSA ->
             Mirage_crypto_pk.Rsa.PKCS1.verify ~hashp ~key ~signature
               (`Digest msg)
-        | Ok (`ED25519 key), `Ed25519 ->
+        | Ok (`ED25519 key), `ED25519 ->
             Mirage_crypto_ec.Ed25519.verify ~key signature ~msg
         | _ -> false in
       let b, bh_ok =
@@ -529,8 +534,8 @@ module Verify = struct
 end
 
 type key =
-  [ `Rsa of Mirage_crypto_pk.Rsa.priv
-  | `Ed25519 of Mirage_crypto_ec.Ed25519.priv ]
+  [ `RSA of Mirage_crypto_pk.Rsa.priv
+  | `ED25519 of Mirage_crypto_ec.Ed25519.priv ]
 
 let assoc field_name fields =
   let res = ref None in
@@ -549,9 +554,7 @@ let remove_assoc field_name fields =
   let res, _ = List.fold_left fold ([], false) fields in
   List.rev res
 
-[@@@warning "-34"]
-
-module Encoder = struct
+module Encoder0 = struct
   open Prettym
   open Dkim.Encoder
 
@@ -561,8 +564,12 @@ module Encoder = struct
 
   let int ppf v = string ppf (string_of_int v)
 
+  let cv ppf = function
+    | `Pass -> string ppf "cv=pass"
+    | `Fail -> string ppf "cv=fail"
+
   let seal_signature ppf (seal : (int * string * [ `Pass | `Fail ]) Dkim.t) =
-    let uid, b, _ = Dkim.signature_and_hash seal in
+    let uid, b, result = Dkim.signature_and_hash seal in
     let a = (Dkim.algorithm seal, Dkim.hash_algorithm seal) in
     let d = Dkim.domain seal in
     let s = Dkim.selector seal in
@@ -571,9 +578,9 @@ module Encoder = struct
         string $ "i="; !!int; char $ ';'; fws; !!algorithm; fws; !!domain; fws
       ; !!selector; fws; !!(option_with_fws timestamp)
       ; !!(option_with_fws expiration); !!(option_with_fws length); fws
-      ; !!signature; fws
+      ; !!signature; fws; !!cv; fws
       ]
-      uid a d s None None None b (* TODO(dinosaure): [t], [q] and [e]. *)
+      uid a d s None None None b result (* TODO(dinosaure): [t], [q] and [e]. *)
 
   let seal_as_field ppf seal =
     eval ppf
@@ -587,7 +594,7 @@ module Encoder = struct
     eval ppf
       [
         string $ "ARC-Message-Signature"; char $ ':'; tbox 1; spaces 1
-      ; string $ "i="; !!int; char $ ';'; fws; !!seal_signature; close; new_line
+      ; string $ "i="; !!int; char $ ';'; fws; !!dkim_signature; close; new_line
       ]
       uid dkim
 
@@ -596,6 +603,7 @@ module Encoder = struct
       [
         string $ "ARC-Authentication-Results"; char $ ':'; tbox 1; spaces 1
       ; string $ "i="; !!int; char $ ';'; fws; !!(Dmarc.Encoder.value ~receiver)
+      ; close; new_line
       ]
       uid results
 end
@@ -608,7 +616,7 @@ module Sign = struct
     ; state : state
     ; seal : key * Dkim.unsigned Dkim.t
     ; msgsig : key * Dkim.unsigned Dkim.t
-    ; results : Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+    ; results : results
     ; chain : Verify.chain
     ; receiver : Emile.domain
   }
@@ -617,20 +625,23 @@ module Sign = struct
     | Fields of Mrmime.Hd.decoder * fields
     | Sign : {
           decoder : Dkim.Body.decoder
-        ; fields : ('signed, 'k) Dkim.Digest.value
+        ; fields : (Dkim.unsigned, 'k) Dkim.Digest.value
         ; stack : [ `CRLF | `Spaces of string ] list
-        ; body : ('signed, 'k) Dkim.Digest.value
+        ; body : (Dkim.unsigned, 'k) Dkim.Digest.value
       }
         -> state
 
   and fields = (Mrmime.Field_name.t * Unstrctrd.t) list
-  and ('k, 'ctx) impl = (module Digestif.S with type t = 'k and type ctx = 'ctx)
-  and 'k digest = 'k Dkim.Digest.t
+  and action = [ `Await of signer | `Malformed of string | `Set of set ]
+  and results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
 
-  and action =
-    [ `Await of signer
-    | `Malformed of string
-    | `Signature of Dkim.signed Dkim.t * Dkim.signed Dkim.t ]
+  and set = {
+      seal : (string * [ `Pass | `Fail ]) Dkim.t
+    ; msgsig : (string * Dkim.hash_value) Dkim.t
+    ; results : results
+    ; uid : int
+    ; receiver : Emile.domain
+  }
 
   let src_rem decoder = decoder.input_len - decoder.input_pos + 1
 
@@ -638,7 +649,7 @@ module Sign = struct
     { decoder with input = Bytes.empty; input_pos = 0; input_len = min_int }
 
   let fill decoder src idx len =
-    if idx < 0 || len < 0 || idx + len >= String.length src
+    if idx < 0 || len < 0 || idx + len > String.length src
     then invalid_arg "Arc.Sign.fill: source out of bounds" ;
     let input = Bytes.unsafe_of_string src in
     let input_pos = idx in
@@ -687,11 +698,11 @@ module Sign = struct
     in
     let b =
       match fst t.msgsig with
-      | `Rsa key ->
+      | `RSA key ->
           let hash = Digestif.hash_to_hash' k in
           let msg = `Digest Hash.(to_raw_string (get ctx)) in
           Mirage_crypto_pk.Rsa.PKCS1.sign ~hash ~key msg
-      | `Ed25519 key ->
+      | `ED25519 key ->
           let msg = Hash.(to_raw_string (get ctx)) in
           Mirage_crypto_ec.Ed25519.sign ~key msg in
     (b, bh)
@@ -703,9 +714,10 @@ module Sign = struct
       | Verify.Broken _ -> List.rev acc in
     go [] t.chain
 
-  let bh_of_seal t bbh =
+  let bh_of_seal t (bbh : string * Dkim.hash_value) =
     let uid = Verify.length t.chain + 1 in
     let chains = valid_sets t in
+    let cv = if Verify.is_valid_chain t.chain then `Pass else `Fail in
     let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
     let module Hash = (val Digestif.module_of a) in
     let feed_string ctx str = Hash.feed_string ctx str in
@@ -714,23 +726,23 @@ module Sign = struct
       List.fold_left (Verify.with_set ~canon ~feed_string) Hash.empty chains
     in
     let results = (t.receiver, uid, t.results) in
-    let field_name, unstrctrd = raw Encoder.results_as_field results in
+    let field_name, unstrctrd = raw Encoder0.results_as_field results in
     let ctx = canon field_name unstrctrd feed_string ctx in
     let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
-    let field_name, unstrctrd = raw Encoder.msgsig_as_field (uid, msgsig) in
+    let field_name, unstrctrd = raw Encoder0.msgsig_as_field (uid, msgsig) in
     let ctx = canon field_name unstrctrd feed_string ctx in
     let canon = Dkim.Canon.of_dkim_fields (snd t.seal) in
-    let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", `Pass) in
-    let field_name, unstrctrd = raw Encoder.seal_as_field seal in
+    let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
+    let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
     let ctx = canon field_name unstrctrd feed_string ctx in
     match fst t.seal with
-    | `Rsa key ->
+    | `RSA key ->
         let hash = Digestif.hash_to_hash' a in
         let msg = `Digest Hash.(to_raw_string (get ctx)) in
-        Mirage_crypto_pk.Rsa.PKCS1.sign ~hash ~key msg
-    | `Ed25519 key ->
+        (Mirage_crypto_pk.Rsa.PKCS1.sign ~hash ~key msg, cv)
+    | `ED25519 key ->
         let msg = Hash.(to_raw_string (get ctx)) in
-        Mirage_crypto_ec.Ed25519.sign ~key msg
+        (Mirage_crypto_ec.Ed25519.sign ~key msg, cv)
 
   let rec fields t decoder fields =
     let open Mrmime in
@@ -777,7 +789,14 @@ module Sign = struct
           sign { t with state } in
     go fields
 
-  and digest t decoder fields stack body =
+  and digest : type k.
+         signer
+      -> Dkim.Body.decoder
+      -> (Dkim.unsigned, k) Dkim.Digest.value
+      -> [ `Spaces of string | `CRLF ] list
+      -> (Dkim.unsigned, k) Dkim.Digest.value
+      -> action =
+   fun t decoder fields stack body ->
     let rec go stack body =
       match Dkim.Body.decode decoder with
       | (`Spaces _ | `CRLF) as x -> go (x :: stack) body
@@ -792,12 +811,65 @@ module Sign = struct
           `Await { t with state; input_pos }
       | `End ->
           let body = Dkim.Digest.digest_wsp [ `CRLF ] body in
-          let _bbh = bbh_of_msgsig t ~fields ~body in
-          assert false in
+          let bbh = bbh_of_msgsig t ~fields ~body in
+          let bh_and_cv = bh_of_seal t bbh in
+          let seal = Dkim.with_signature_and_hash (snd t.seal) bh_and_cv in
+          let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
+          let uid = Verify.length t.chain + 1 in
+          let receiver = t.receiver in
+          let set = { seal; msgsig; results = t.results; uid; receiver } in
+          `Set set in
     go stack body
 
   and sign t =
     match t.state with
     | Fields (decoder, fs) -> fields t decoder fs
-    | _ -> assert false
+    | Sign { decoder; fields; stack; body } ->
+        digest t decoder fields stack body
+
+  type seal = Dkim.unsigned Dkim.t
+
+  let seal ?(algorithm = `RSA) ?(hash = `SHA256) ?timestamp ?expiration
+      ~selector domain =
+    Dkim.v ~canonicalization:(`Relaxed, `Relaxed)
+      ~fields:[ Mrmime.Field_name.from ] ?timestamp ?expiration ~selector domain
+
+  let signer ~seal ~msgsig ~receiver ~results key chain =
+    let key_seal, key_msgsig =
+      match key with
+      | key_seal, None ->
+          (* TODO(dinosaure): verify that the selector and the domain of [msgsig]
+             is the same as [seal]. *)
+          (key_seal, key_seal)
+      | key_seal, Some key_msgsig -> (key_seal, key_msgsig) in
+    let input, input_pos, input_len = (Bytes.empty, 1, 0) in
+    let dec = Mrmime.Hd.decoder p in
+    let state = Fields (dec, []) in
+    let seal = (key_seal, seal) in
+    let msgsig = (key_msgsig, msgsig) in
+    {
+      input
+    ; input_pos
+    ; input_len
+    ; seal
+    ; msgsig
+    ; state
+    ; receiver
+    ; results
+    ; chain
+    }
+end
+
+module Encoder = struct
+  open Prettym
+
+  let stamp ppf { Sign.seal; msgsig; results; uid; receiver } =
+    let bh, cv = Dkim.signature_and_hash seal in
+    let seal = Dkim.with_signature_and_hash seal (uid, bh, cv) in
+    eval ppf
+      [
+        !!Encoder0.seal_as_field; !!Encoder0.msgsig_as_field
+      ; !!Encoder0.results_as_field
+      ]
+      seal (uid, msgsig) (receiver, uid, results)
 end
