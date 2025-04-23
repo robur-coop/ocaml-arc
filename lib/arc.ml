@@ -688,19 +688,27 @@ module Sign = struct
     let bh =
       Dkim.Hash_value
         (k, Digestif.of_raw_string k Hash.(to_raw_string (get ctx))) in
+    let uid = Verify.length t.chain + 1 in
     let fake = Dkim.with_signature_and_hash (snd t.msgsig) ("", bh) in
-    let field_name, unstrctrd = raw Dkim.Encoder.as_field fake in
-    let _, Dkim.Digest.Digest { m = (module Hash); ctx } = fields in
-    let feed_string str ctx = Hash.feed_string str ctx in
-    let canon = Dkim.Canon.of_dkim_fields in
-    let ctx =
-      canon (snd t.msgsig) Dkim.field_dkim_signature unstrctrd feed_string ctx
+    let fake =
+      Prettym.to_string ~new_line:"\r\n" Encoder0.msgsig_as_field (uid, fake)
     in
+    let unstrctrd = Angstrom.parse_string ~consume:All field_and_value fake in
+    let _, unstrctrd = Result.get_ok unstrctrd in
+    Log.debug (fun m ->
+        m "sign %a field with:" Mrmime.Field_name.pp field_arc_message_signature) ;
+    Log.debug (fun m -> m "%s" (Unstrctrd.to_utf_8_string unstrctrd)) ;
+    let _, Dkim.Digest.Digest { m = (module Hash); ctx } = fields in
+    let feed_string ctx str = Hash.feed_string ctx str in
+    let canon = Dkim.Canon.of_dkim_fields in
+    let dkim = snd t.msgsig in
+    let ctx = canon dkim field_arc_message_signature unstrctrd feed_string ctx in
     let b =
       match fst t.msgsig with
       | `RSA key ->
           let hash = Digestif.hash_to_hash' k in
-          let msg = `Digest Hash.(to_raw_string (get ctx)) in
+          let msg = Hash.(to_raw_string (get ctx)) in
+          let msg = `Digest msg in
           Mirage_crypto_pk.Rsa.PKCS1.sign ~hash ~key msg
       | `ED25519 key ->
           let msg = Hash.(to_raw_string (get ctx)) in
@@ -767,8 +775,9 @@ module Sign = struct
           let module Hash = (val Digestif.module_of k) in
           let feed_string ctx str = Hash.feed_string ctx str in
           let canon = Dkim.Canon.of_fields (snd t.msgsig) in
-          let fn (ctx, fields) requested =
-            match assoc requested fields with
+          let fn (ctx, fields) reqs =
+            Log.debug (fun m -> m "sign %a field" Mrmime.Field_name.pp reqs) ;
+            match assoc reqs fields with
             | Some (field_name, unstrctrd) ->
                 let ctx = canon field_name unstrctrd feed_string ctx in
                 (ctx, remove_assoc field_name fields)
@@ -779,7 +788,8 @@ module Sign = struct
               (Dkim.fields (snd t.msgsig)) in
           let fields = Dkim.Digest.Digest { m = (module Hash); ctx } in
           let fields = (snd t.msgsig, fields) in
-          let body = Dkim.Digest.Digest { m = (module Hash); ctx } in
+          let body =
+            Dkim.Digest.Digest { m = (module Hash); ctx = Hash.empty } in
           let body = (snd t.msgsig, body) in
           let decoder = Dkim.Body.decoder () in
           let prelude = Bytes.unsafe_of_string prelude in
