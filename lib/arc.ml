@@ -257,7 +257,10 @@ module Verify = struct
       let canon1 = Dkim.Canon.of_dkim_fields (fst set.seal).seal in
       let ctx =
         match cv with
-        | `None | `Fail -> Hash.empty
+        | `None | `Fail ->
+            Log.debug (fun m ->
+                m "calculate the seal signature from nothing for [%02d]" set.uid) ;
+            Hash.empty
         | `Pass ->
             let older = List.filter (fun set' -> set'.uid < set.uid) sets in
             let older =
@@ -565,8 +568,8 @@ module Encoder0 = struct
   let int ppf v = string ppf (string_of_int v)
 
   let cv ppf = function
-    | `Pass -> string ppf "cv=pass"
-    | `Fail -> string ppf "cv=fail"
+    | `Pass -> string ppf "cv=pass;"
+    | `Fail -> string ppf "cv=fail;"
 
   let seal_signature ppf (seal : (int * string * [ `Pass | `Fail ]) Dkim.t) =
     let uid, b, result = Dkim.signature_and_hash seal in
@@ -577,10 +580,10 @@ module Encoder0 = struct
       [
         string $ "i="; !!int; char $ ';'; fws; !!algorithm; fws; !!domain; fws
       ; !!selector; fws; !!(option_with_fws timestamp)
-      ; !!(option_with_fws expiration); !!(option_with_fws length); fws
-      ; !!signature; fws; !!cv; fws
+      ; !!(option_with_fws expiration); !!(option_with_fws length); !!cv; fws
+      ; !!signature; fws
       ]
-      uid a d s None None None b result (* TODO(dinosaure): [t], [q] and [e]. *)
+      uid a d s None None None result b (* TODO(dinosaure): [t], [q] and [e]. *)
 
   let seal_as_field ppf seal =
     eval ppf
@@ -717,7 +720,7 @@ module Sign = struct
 
   let valid_sets t =
     let rec go acc = function
-      | Verify.Nil _ -> List.rev acc
+      | Verify.Nil _ -> acc
       | Verify.Valid { set; next; _ } -> go (set :: acc) next
       | Verify.Broken _ -> List.rev acc in
     go [] t.chain
@@ -729,20 +732,21 @@ module Sign = struct
     let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
     let module Hash = (val Digestif.module_of a) in
     let feed_string ctx str = Hash.feed_string ctx str in
-    let canon = Dkim.Canon.of_fields (snd t.seal) in
+    let canon0 = Dkim.Canon.of_fields (snd t.seal) in
+    let canon1 = Dkim.Canon.of_dkim_fields (snd t.seal) in
     let ctx =
-      List.fold_left (Verify.with_set ~canon ~feed_string) Hash.empty chains
-    in
+      List.fold_left
+        (Verify.with_set ~canon:canon0 ~feed_string)
+        Hash.empty chains in
     let results = (t.receiver, uid, t.results) in
     let field_name, unstrctrd = raw Encoder0.results_as_field results in
-    let ctx = canon field_name unstrctrd feed_string ctx in
+    let ctx = canon0 field_name unstrctrd feed_string ctx in
     let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
     let field_name, unstrctrd = raw Encoder0.msgsig_as_field (uid, msgsig) in
-    let ctx = canon field_name unstrctrd feed_string ctx in
-    let canon = Dkim.Canon.of_dkim_fields (snd t.seal) in
+    let ctx = canon0 field_name unstrctrd feed_string ctx in
     let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
     let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
-    let ctx = canon field_name unstrctrd feed_string ctx in
+    let ctx = canon1 field_name unstrctrd feed_string ctx in
     match fst t.seal with
     | `RSA key ->
         let hash = Digestif.hash_to_hash' a in
