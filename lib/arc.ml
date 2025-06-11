@@ -912,4 +912,7 @@ module Encoder = struct
         eval ppf
           [ !!Encoder0.seal_as_field; !!Encoder0.msgsig_as_field ]
           seal (uid, msgsig)
+
+  let stamp_results ~receiver ~uid ppf results =
+    eval ppf [ !!Encoder0.results_as_field ] (receiver, uid, results)
 end

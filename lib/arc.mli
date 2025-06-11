@@ -73,4 +73,7 @@ end
 
 module Encoder : sig
   val stamp : Sign.set Prettym.t
+
+  val stamp_results :
+    receiver:Emile.domain -> uid:int -> Sign.user's_results Prettym.t
 end
