@@ -46,8 +46,14 @@ module Sign : sig
   type signer
   type set
   type seal
-  type action = [ `Await of signer | `Malformed of string | `Set of set ]
-  type results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+
+  type action =
+    [ `Await of signer
+    | `Malformed of string
+    | `Missing_authentication_results
+    | `Set of set ]
+
+  type user's_results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
 
   val sign : signer -> action
   val fill : signer -> string -> int -> int -> signer
@@ -65,7 +71,7 @@ module Sign : sig
        seal:seal
     -> msgsig:Dkim.unsigned Dkim.t
     -> receiver:Emile.domain
-    -> results:results
+    -> ?results:user's_results
     -> key * key option
     -> Verify.chain
     -> signer
@@ -73,4 +79,7 @@ end
 
 module Encoder : sig
   val stamp : Sign.set Prettym.t
+
+  val stamp_results :
+    receiver:Emile.domain -> uid:int -> Sign.user's_results Prettym.t
 end

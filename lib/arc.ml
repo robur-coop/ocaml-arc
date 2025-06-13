@@ -2,7 +2,7 @@ let src = Logs.Src.create "arc"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-[@@@warning "-27-30-32"]
+[@@@warning "-30"]
 
 (* An ARC set *)
 type t = { results : results; msgsig : signature; seal : seal; uid : int }
@@ -174,11 +174,6 @@ module Verify = struct
       }
         -> chain
     | Broken : t * chain -> chain
-
-  let pp_field ppf = function
-    | Msgsig _ -> Fmt.string ppf "Message-Signature"
-    | Results _ -> Fmt.string ppf "Authentication-Results"
-    | Seal _ -> Fmt.string ppf "Seal"
 
   let rec length = function
     | Nil _ -> 0
@@ -435,7 +430,7 @@ module Verify = struct
         then Dkim.Body.src decoder prelude 0 (Bytes.length prelude) ;
         let state = Body (decoder, [], ctxs) in
         decode { t with state }
-    | set :: todo -> `Queries (t, set)
+    | set :: _todo -> `Queries (t, set)
 
   and digest t decoder stack ctxs =
     let rec go stack results =
@@ -612,6 +607,11 @@ module Encoder0 = struct
 end
 
 module Sign = struct
+  type authentication_results =
+    [ `User's_result of user's_results | `Mail's_result of Unstrctrd.t ]
+
+  and user's_results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+
   type signer = {
       input : bytes
     ; input_pos : int
@@ -619,7 +619,7 @@ module Sign = struct
     ; state : state
     ; seal : key * Dkim.unsigned Dkim.t
     ; msgsig : key * Dkim.unsigned Dkim.t
-    ; results : results
+    ; mutable results : [ authentication_results | `Unspecified ]
     ; chain : Verify.chain
     ; receiver : Emile.domain
   }
@@ -635,13 +635,17 @@ module Sign = struct
         -> state
 
   and fields = (Mrmime.Field_name.t * Unstrctrd.t) list
-  and action = [ `Await of signer | `Malformed of string | `Set of set ]
-  and results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+
+  and action =
+    [ `Await of signer
+    | `Malformed of string
+    | `Missing_authentication_results
+    | `Set of set ]
 
   and set = {
       seal : (string * [ `Pass | `Fail ]) Dkim.t
     ; msgsig : (string * Dkim.hash_value) Dkim.t
-    ; results : results
+    ; results : authentication_results
     ; uid : int
     ; receiver : Emile.domain
   }
@@ -725,7 +729,7 @@ module Sign = struct
       | Verify.Broken _ -> List.rev acc in
     go [] t.chain
 
-  let bh_of_seal t (bbh : string * Dkim.hash_value) =
+  let bh_of_seal t (bbh : string * Dkim.hash_value) results =
     let uid = Verify.length t.chain + 1 in
     let chains = valid_sets t in
     let cv = if Verify.is_valid_chain t.chain then `Pass else `Fail in
@@ -738,8 +742,12 @@ module Sign = struct
       List.fold_left
         (Verify.with_set ~canon:canon0 ~feed_string)
         Hash.empty chains in
-    let results = (t.receiver, uid, t.results) in
-    let field_name, unstrctrd = raw Encoder0.results_as_field results in
+    let field_name, unstrctrd =
+      match results with
+      | `User's_result results ->
+          raw Encoder0.results_as_field (t.receiver, uid, results)
+      | `Mail's_result unstrctrd -> (field_arc_authentication_results, unstrctrd)
+    in
     let ctx = canon0 field_name unstrctrd feed_string ctx in
     let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
     let field_name, unstrctrd = raw Encoder0.msgsig_as_field (uid, msgsig) in
@@ -766,13 +774,26 @@ module Sign = struct
           let input_pos = t.input_pos + rem in
           let t = { t with state; input_pos } in
           `Await t
-      | `Field field -> (
+      | `Field field ->
           let (Field.Field (field_name, w, v)) = Location.prj field in
-          match w with
-          | Field.Unstructured ->
-              let v = to_unstrctrd v in
-              go ((field_name, v) :: fields)
-          | _ -> assert false)
+          let fn, unstrctrd =
+            match w with
+            | Field.Unstructured -> (field_name, to_unstrctrd v)
+            | _ -> assert false in
+          let results =
+            match (t.results, is_arc_authentication_results field_name) with
+            | (`User's_result _ | `Mail's_result _), _ -> t.results
+            | `Unspecified, false -> `Unspecified
+            | `Unspecified, true -> (
+                let uid = Verify.length t.chain + 1 in
+                match get_authentication_results fn unstrctrd with
+                | Ok (uid', _) when uid = uid' ->
+                    Log.debug (fun m ->
+                        m "Get an ARC-Authentication-Results with uid:%d" uid') ;
+                    `Mail's_result unstrctrd
+                | _ -> `Unspecified) in
+          t.results <- results ;
+          go ((fn, unstrctrd) :: fields)
       | `Malformed _ as err -> err
       | `End prelude ->
           let (Hash_algorithm k) = Dkim.hash_algorithm (snd t.msgsig) in
@@ -824,15 +845,18 @@ module Sign = struct
           let input_pos = t.input_pos + rem in
           `Await { t with state; input_pos }
       | `End ->
+      match t.results with
+      | #authentication_results as results ->
           let body = Dkim.Digest.digest_wsp [ `CRLF ] body in
           let bbh = bbh_of_msgsig t ~fields ~body in
-          let bh_and_cv = bh_of_seal t bbh in
+          let bh_and_cv = bh_of_seal t bbh results in
           let seal = Dkim.with_signature_and_hash (snd t.seal) bh_and_cv in
           let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
           let uid = Verify.length t.chain + 1 in
           let receiver = t.receiver in
-          let set = { seal; msgsig; results = t.results; uid; receiver } in
-          `Set set in
+          let set = { seal; msgsig; results; uid; receiver } in
+          `Set set
+      | `Unspecified -> `Missing_authentication_results in
     go stack body
 
   and sign t =
@@ -845,10 +869,10 @@ module Sign = struct
 
   let seal ?(algorithm = `RSA) ?(hash = `SHA256) ?timestamp ?expiration
       ~selector domain =
-    Dkim.v ~canonicalization:(`Relaxed, `Relaxed)
+    Dkim.v ~canonicalization:(`Relaxed, `Relaxed) ~algorithm ~hash
       ~fields:[ Mrmime.Field_name.from ] ?timestamp ?expiration ~selector domain
 
-  let signer ~seal ~msgsig ~receiver ~results key chain =
+  let signer ~seal ~msgsig ~receiver ?results key chain =
     let key_seal, key_msgsig =
       match key with
       | key_seal, None ->
@@ -861,6 +885,10 @@ module Sign = struct
     let state = Fields (dec, []) in
     let seal = (key_seal, seal) in
     let msgsig = (key_msgsig, msgsig) in
+    let results =
+      match results with
+      | None -> `Unspecified
+      | Some results -> `User's_result results in
     {
       input
     ; input_pos
@@ -880,10 +908,19 @@ module Encoder = struct
   let stamp ppf { Sign.seal; msgsig; results; uid; receiver } =
     let bh, cv = Dkim.signature_and_hash seal in
     let seal = Dkim.with_signature_and_hash seal (uid, bh, cv) in
-    eval ppf
-      [
-        !!Encoder0.seal_as_field; !!Encoder0.msgsig_as_field
-      ; !!Encoder0.results_as_field
-      ]
-      seal (uid, msgsig) (receiver, uid, results)
+    match results with
+    | `User's_result results ->
+        eval ppf
+          [
+            !!Encoder0.seal_as_field; !!Encoder0.msgsig_as_field
+          ; !!Encoder0.results_as_field
+          ]
+          seal (uid, msgsig) (receiver, uid, results)
+    | `Mail's_result _ ->
+        eval ppf
+          [ !!Encoder0.seal_as_field; !!Encoder0.msgsig_as_field ]
+          seal (uid, msgsig)
+
+  let stamp_results ~receiver ~uid ppf results =
+    eval ppf [ !!Encoder0.results_as_field ] (receiver, uid, results)
 end
