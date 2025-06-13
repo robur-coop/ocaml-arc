@@ -635,7 +635,12 @@ module Sign = struct
         -> state
 
   and fields = (Mrmime.Field_name.t * Unstrctrd.t) list
-  and action = [ `Await of signer | `Malformed of string | `Set of set ]
+
+  and action =
+    [ `Await of signer
+    | `Malformed of string
+    | `Missing_authentication_results
+    | `Set of set ]
 
   and set = {
       seal : (string * [ `Pass | `Fail ]) Dkim.t
@@ -782,7 +787,10 @@ module Sign = struct
             | `Unspecified, true -> (
                 let uid = Verify.length t.chain + 1 in
                 match get_authentication_results fn unstrctrd with
-                | Ok (uid', _) when uid = uid' -> `Mail's_result unstrctrd
+                | Ok (uid', _) when uid = uid' ->
+                    Log.debug (fun m ->
+                        m "Get an ARC-Authentication-Results with uid:%d" uid') ;
+                    `Mail's_result unstrctrd
                 | _ -> `Unspecified) in
           t.results <- results ;
           go ((fn, unstrctrd) :: fields)
@@ -848,7 +856,7 @@ module Sign = struct
           let receiver = t.receiver in
           let set = { seal; msgsig; results; uid; receiver } in
           `Set set
-      | `Unspecified -> assert false in
+      | `Unspecified -> `Missing_authentication_results in
     go stack body
 
   and sign t =

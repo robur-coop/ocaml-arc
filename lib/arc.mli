@@ -46,7 +46,13 @@ module Sign : sig
   type signer
   type set
   type seal
-  type action = [ `Await of signer | `Malformed of string | `Set of set ]
+
+  type action =
+    [ `Await of signer
+    | `Malformed of string
+    | `Missing_authentication_results
+    | `Set of set ]
+
   type user's_results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
 
   val sign : signer -> action
