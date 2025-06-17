@@ -562,7 +562,8 @@ module Encoder0 = struct
 
   let int ppf v = string ppf (string_of_int v)
 
-  let cv ppf = function
+  let cv ~uid ppf = function
+    | `Pass when uid <= 1 -> string ppf "cv=none;"
     | `Pass -> string ppf "cv=pass;"
     | `Fail -> string ppf "cv=fail;"
 
@@ -575,8 +576,8 @@ module Encoder0 = struct
       [
         string $ "i="; !!int; char $ ';'; fws; !!algorithm; fws; !!domain; fws
       ; !!selector; fws; !!(option_with_fws timestamp)
-      ; !!(option_with_fws expiration); !!(option_with_fws length); !!cv; fws
-      ; !!signature; fws
+      ; !!(option_with_fws expiration); !!(option_with_fws length); !!(cv ~uid)
+      ; fws; !!signature; fws
       ]
       uid a d s None None None result b (* TODO(dinosaure): [t], [q] and [e]. *)
 
