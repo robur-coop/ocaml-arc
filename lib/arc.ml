@@ -873,6 +873,8 @@ module Sign = struct
     Dkim.v ~canonicalization:(`Relaxed, `Relaxed) ~algorithm ~hash
       ~fields:[ Mrmime.Field_name.from ] ?timestamp ?expiration ~selector domain
 
+  let expire seal = Dkim.expire seal
+
   let signer ~seal ~msgsig ~receiver ?results key chain =
     let key_seal, key_msgsig =
       match key with

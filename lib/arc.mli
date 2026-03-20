@@ -67,6 +67,8 @@ module Sign : sig
     -> [ `raw ] Domain_name.t
     -> seal
 
+  val expire : seal -> int64 option
+
   val signer :
        seal:seal
     -> msgsig:Dkim.unsigned Dkim.t
