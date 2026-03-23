@@ -215,7 +215,7 @@ let run _quiet seal msgsig keys newline receiver input =
   let results = Miou.await_exn prm0 and chain = Miou.await_exn prm1 in
   match (results, chain) with
   | Ok results, Ok chain ->
-      sign seal msgsig keys newline receiver msg results chain
+      sign seal msgsig keys newline receiver msg results (`Verified chain)
   | Error err, _ -> Fmt.failwith "%a." Dmarc.Verify.pp_error err
   | _, Error (`Msg msg) -> Fmt.failwith "%s." msg
 

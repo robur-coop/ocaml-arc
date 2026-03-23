@@ -612,6 +612,9 @@ module Sign = struct
     [ `User's_result of user's_results | `Mail's_result of Unstrctrd.t ]
 
   and user's_results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+  and value = Field_name.t * Unstrctrd.t
+  and user's_set = value * value * value
+  and user's_chain = user's_set list
 
   type signer = {
       input : bytes
@@ -621,7 +624,7 @@ module Sign = struct
     ; seal : key * Dkim.unsigned Dkim.t
     ; msgsig : key * Dkim.unsigned Dkim.t
     ; mutable results : [ authentication_results | `Unspecified ]
-    ; chain : Verify.chain
+    ; chain : [ `Verified of Verify.chain | `Unverified of user's_chain ]
     ; receiver : Emile.domain
   }
 
@@ -685,6 +688,10 @@ module Sign = struct
     let v = Angstrom.parse_string ~consume:All field_and_value str in
     Result.get_ok v
 
+  let length_of_chain = function
+    | `Verified chain -> Verify.length chain
+    | `Unverified chain -> List.length chain
+
   let bbh_of_msgsig : type k0 k1.
          signer
       -> fields:(Dkim.unsigned, k0) Dkim.Digest.value
@@ -696,7 +703,7 @@ module Sign = struct
     let bh =
       Dkim.Hash_value
         (k, Digestif.of_raw_string k Hash.(to_raw_string (get ctx))) in
-    let uid = Verify.length t.chain + 1 in
+    let uid = length_of_chain t.chain + 1 in
     let fake = Dkim.with_signature_and_hash (snd t.msgsig) ("", bh) in
     let fake =
       Prettym.to_string ~new_line:"\r\n" Encoder0.msgsig_as_field (uid, fake)
@@ -723,47 +730,80 @@ module Sign = struct
           Mirage_crypto_ec.Ed25519.sign ~key msg in
     (b, bh)
 
-  let valid_sets t =
+  let valid_sets chain =
     let rec go acc = function
       | Verify.Nil _ -> acc
       | Verify.Valid { set; next; _ } -> go (set :: acc) next
       | Verify.Broken _ -> List.rev acc in
-    go [] t.chain
+    go [] chain
 
   let bh_of_seal t (bbh : string * Dkim.hash_value) results =
-    let uid = Verify.length t.chain + 1 in
-    let chains = valid_sets t in
-    let cv = if Verify.is_valid_chain t.chain then `Pass else `Fail in
-    let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
-    let module Hash = (val Digestif.module_of a) in
-    let feed_string ctx str = Hash.feed_string ctx str in
-    let canon0 = Dkim.Canon.of_fields (snd t.seal) in
-    let canon1 = Dkim.Canon.of_dkim_fields (snd t.seal) in
-    let ctx =
-      List.fold_left
-        (Verify.with_set ~canon:canon0 ~feed_string)
-        Hash.empty chains in
-    let field_name, unstrctrd =
-      match results with
-      | `User's_result results ->
-          raw Encoder0.results_as_field (t.receiver, uid, results)
-      | `Mail's_result unstrctrd -> (field_arc_authentication_results, unstrctrd)
-    in
-    let ctx = canon0 field_name unstrctrd feed_string ctx in
-    let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
-    let field_name, unstrctrd = raw Encoder0.msgsig_as_field (uid, msgsig) in
-    let ctx = canon0 field_name unstrctrd feed_string ctx in
-    let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
-    let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
-    let ctx = canon1 field_name unstrctrd feed_string ctx in
+    let uid = length_of_chain t.chain + 1 in
+    let cv, hash, msg =
+      match t.chain with
+      | `Verified chain ->
+          let cv = if Verify.is_valid_chain chain then `Pass else `Fail in
+          let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
+          let module Hash = (val Digestif.module_of a) in
+          let feed_string ctx str = Hash.feed_string ctx str in
+          let canon0 = Dkim.Canon.of_fields (snd t.seal) in
+          let canon1 = Dkim.Canon.of_dkim_fields (snd t.seal) in
+          let chain = valid_sets chain in
+          let ctx =
+            List.fold_left
+              (Verify.with_set ~canon:canon0 ~feed_string)
+              Hash.empty chain in
+          let field_name, unstrctrd =
+            match results with
+            | `User's_result results ->
+                raw Encoder0.results_as_field (t.receiver, uid, results)
+            | `Mail's_result unstrctrd ->
+                (field_arc_authentication_results, unstrctrd) in
+          let ctx = canon0 field_name unstrctrd feed_string ctx in
+          let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
+          let field_name, unstrctrd =
+            raw Encoder0.msgsig_as_field (uid, msgsig) in
+          let ctx = canon0 field_name unstrctrd feed_string ctx in
+          let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
+          let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
+          let ctx = canon1 field_name unstrctrd feed_string ctx in
+          let hash = Digestif.hash_to_hash' a in
+          (cv, hash, Hash.to_raw_string (Hash.get ctx))
+      | `Unverified chain ->
+          let cv = `Pass in
+          let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
+          let module Hash = (val Digestif.module_of a) in
+          let feed_string ctx str = Hash.feed_string ctx str in
+          let canon0 = Dkim.Canon.of_fields (snd t.seal) in
+          let canon1 = Dkim.Canon.of_dkim_fields (snd t.seal) in
+          let ctx =
+            let fn ctx (authentication_results, message_signature, seal) =
+              let field_name, unstrctrd = authentication_results in
+              let ctx = canon0 field_name unstrctrd feed_string ctx in
+              let field_name, unstrctrd = message_signature in
+              let ctx = canon0 field_name unstrctrd feed_string ctx in
+              let field_name, unstrctrd = seal in
+              canon0 field_name unstrctrd feed_string ctx in
+            List.fold_left fn Hash.empty chain in
+          let field_name, unstrctrd =
+            match results with
+            | `User's_result results ->
+                raw Encoder0.results_as_field (t.receiver, uid, results)
+            | `Mail's_result unstrctrd ->
+                (field_arc_authentication_results, unstrctrd) in
+          let ctx = canon0 field_name unstrctrd feed_string ctx in
+          let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
+          let field_name, unstrctrd =
+            raw Encoder0.msgsig_as_field (uid, msgsig) in
+          let ctx = canon0 field_name unstrctrd feed_string ctx in
+          let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
+          let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
+          let ctx = canon1 field_name unstrctrd feed_string ctx in
+          let hash = Digestif.hash_to_hash' a in
+          (cv, hash, Hash.to_raw_string (Hash.get ctx)) in
     match fst t.seal with
-    | `RSA key ->
-        let hash = Digestif.hash_to_hash' a in
-        let msg = `Digest Hash.(to_raw_string (get ctx)) in
-        (Mirage_crypto_pk.Rsa.PKCS1.sign ~hash ~key msg, cv)
-    | `ED25519 key ->
-        let msg = Hash.(to_raw_string (get ctx)) in
-        (Mirage_crypto_ec.Ed25519.sign ~key msg, cv)
+    | `RSA key -> (Mirage_crypto_pk.Rsa.PKCS1.sign ~hash ~key (`Digest msg), cv)
+    | `ED25519 key -> (Mirage_crypto_ec.Ed25519.sign ~key msg, cv)
 
   let rec fields t decoder fields =
     let open Mrmime in
@@ -786,7 +826,7 @@ module Sign = struct
             | (`User's_result _ | `Mail's_result _), _ -> t.results
             | `Unspecified, false -> `Unspecified
             | `Unspecified, true -> (
-                let uid = Verify.length t.chain + 1 in
+                let uid = length_of_chain t.chain + 1 in
                 match get_authentication_results fn unstrctrd with
                 | Ok (uid', _) when uid = uid' ->
                     Log.debug (fun m ->
@@ -853,7 +893,7 @@ module Sign = struct
           let bh_and_cv = bh_of_seal t bbh results in
           let seal = Dkim.with_signature_and_hash (snd t.seal) bh_and_cv in
           let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
-          let uid = Verify.length t.chain + 1 in
+          let uid = length_of_chain t.chain + 1 in
           let receiver = t.receiver in
           let set = { seal; msgsig; results; uid; receiver } in
           `Set set
