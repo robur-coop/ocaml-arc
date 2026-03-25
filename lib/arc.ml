@@ -593,7 +593,8 @@ module Encoder0 = struct
     eval ppf
       [
         string $ "ARC-Message-Signature"; char $ ':'; tbox 1; spaces 1
-      ; string $ "i="; !!int; char $ ';'; fws; !!dkim_signature; close; new_line
+      ; string $ "i="; !!int; char $ ';'; fws
+      ; !!(dkim_signature ~with_version:false); close; new_line
       ]
       uid dkim
 
