@@ -55,6 +55,10 @@ module Sign : sig
 
   type user's_results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
 
+  type value = Mrmime.Field_name.t * Unstrctrd.t
+  and user's_set = value * value * value
+  and user's_chain = user's_set list
+
   val sign : signer -> action
   val fill : signer -> string -> int -> int -> signer
 
@@ -67,13 +71,15 @@ module Sign : sig
     -> [ `raw ] Domain_name.t
     -> seal
 
+  val expire : seal -> int64 option
+
   val signer :
        seal:seal
     -> msgsig:Dkim.unsigned Dkim.t
     -> receiver:Emile.domain
     -> ?results:user's_results
     -> key * key option
-    -> Verify.chain
+    -> [ `Verified of Verify.chain | `Unverified of user's_chain ]
     -> signer
 end
 
