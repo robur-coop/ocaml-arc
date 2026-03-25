@@ -739,43 +739,23 @@ module Sign = struct
 
   let bh_of_seal t (bbh : string * Dkim.hash_value) results =
     let uid = length_of_chain t.chain + 1 in
-    let cv, hash, msg =
+    let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
+    let module Hash = (val Digestif.module_of a) in
+    let feed_string ctx str = Hash.feed_string ctx str in
+    let canon0 = Dkim.Canon.of_fields (snd t.seal) in
+    let canon1 = Dkim.Canon.of_dkim_fields (snd t.seal) in
+    let cv, (ctx : Hash.ctx) =
       match t.chain with
       | `Verified chain ->
           let cv = if Verify.is_valid_chain chain then `Pass else `Fail in
-          let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
-          let module Hash = (val Digestif.module_of a) in
-          let feed_string ctx str = Hash.feed_string ctx str in
-          let canon0 = Dkim.Canon.of_fields (snd t.seal) in
-          let canon1 = Dkim.Canon.of_dkim_fields (snd t.seal) in
           let chain = valid_sets chain in
           let ctx =
             List.fold_left
               (Verify.with_set ~canon:canon0 ~feed_string)
               Hash.empty chain in
-          let field_name, unstrctrd =
-            match results with
-            | `User's_result results ->
-                raw Encoder0.results_as_field (t.receiver, uid, results)
-            | `Mail's_result unstrctrd ->
-                (field_arc_authentication_results, unstrctrd) in
-          let ctx = canon0 field_name unstrctrd feed_string ctx in
-          let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
-          let field_name, unstrctrd =
-            raw Encoder0.msgsig_as_field (uid, msgsig) in
-          let ctx = canon0 field_name unstrctrd feed_string ctx in
-          let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
-          let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
-          let ctx = canon1 field_name unstrctrd feed_string ctx in
-          let hash = Digestif.hash_to_hash' a in
-          (cv, hash, Hash.to_raw_string (Hash.get ctx))
+          (cv, ctx)
       | `Unverified chain ->
           let cv = `Pass in
-          let (Hash_algorithm a) = Dkim.hash_algorithm (snd t.seal) in
-          let module Hash = (val Digestif.module_of a) in
-          let feed_string ctx str = Hash.feed_string ctx str in
-          let canon0 = Dkim.Canon.of_fields (snd t.seal) in
-          let canon1 = Dkim.Canon.of_dkim_fields (snd t.seal) in
           let ctx =
             let fn ctx (authentication_results, message_signature, seal) =
               let field_name, unstrctrd = authentication_results in
@@ -785,22 +765,22 @@ module Sign = struct
               let field_name, unstrctrd = seal in
               canon0 field_name unstrctrd feed_string ctx in
             List.fold_left fn Hash.empty chain in
-          let field_name, unstrctrd =
-            match results with
-            | `User's_result results ->
-                raw Encoder0.results_as_field (t.receiver, uid, results)
-            | `Mail's_result unstrctrd ->
-                (field_arc_authentication_results, unstrctrd) in
-          let ctx = canon0 field_name unstrctrd feed_string ctx in
-          let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
-          let field_name, unstrctrd =
-            raw Encoder0.msgsig_as_field (uid, msgsig) in
-          let ctx = canon0 field_name unstrctrd feed_string ctx in
-          let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
-          let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
-          let ctx = canon1 field_name unstrctrd feed_string ctx in
-          let hash = Digestif.hash_to_hash' a in
-          (cv, hash, Hash.to_raw_string (Hash.get ctx)) in
+          (cv, ctx) in
+    let field_name, unstrctrd =
+      match results with
+      | `User's_result results ->
+          raw Encoder0.results_as_field (t.receiver, uid, results)
+      | `Mail's_result unstrctrd -> (field_arc_authentication_results, unstrctrd)
+    in
+    let ctx = canon0 field_name unstrctrd feed_string ctx in
+    let msgsig = Dkim.with_signature_and_hash (snd t.msgsig) bbh in
+    let field_name, unstrctrd = raw Encoder0.msgsig_as_field (uid, msgsig) in
+    let ctx = canon0 field_name unstrctrd feed_string ctx in
+    let seal = Dkim.with_signature_and_hash (snd t.seal) (uid, "", cv) in
+    let field_name, unstrctrd = raw Encoder0.seal_as_field seal in
+    let ctx = canon1 field_name unstrctrd feed_string ctx in
+    let hash = Digestif.hash_to_hash' a in
+    let msg = Hash.to_raw_string (Hash.get ctx) in
     match fst t.seal with
     | `RSA key -> (Mirage_crypto_pk.Rsa.PKCS1.sign ~hash ~key (`Digest msg), cv)
     | `ED25519 key -> (Mirage_crypto_ec.Ed25519.sign ~key msg, cv)
