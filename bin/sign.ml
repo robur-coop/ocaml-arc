@@ -178,12 +178,10 @@ let verify dns newline stream =
   go decoder
 
 let run _quiet seal msgsig keys newline receiver input =
+  Mirage_crypto_rng_unix.use_default () ;
   Miou_unix.run @@ fun () ->
   let daemon, he = Happy_eyeballs_miou_unix.create () in
-  let rng = Mirage_crypto_rng_miou_unix.(initialize (module Pfortuna)) in
-  let finally () =
-    Happy_eyeballs_miou_unix.kill daemon ;
-    Mirage_crypto_rng_miou_unix.kill rng in
+  let finally () = Happy_eyeballs_miou_unix.kill daemon in
   Fun.protect ~finally @@ fun () ->
   let dns = Dns_client_miou_unix.create he in
   let ic, ic_close =
