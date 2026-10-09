@@ -53,7 +53,7 @@ module Sign : sig
     | `Missing_authentication_results
     | `Set of set ]
 
-  type user's_results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+  type user's_results = Dmarc.Verify.info
 
   type value = Mrmime.Field_name.t * Unstrctrd.t
   and user's_set = value * value * value

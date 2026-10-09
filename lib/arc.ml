@@ -617,7 +617,7 @@ module Sign = struct
   type authentication_results =
     [ `User's_result of user's_results | `Mail's_result of Unstrctrd.t ]
 
-  and user's_results = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+  and user's_results = Dmarc.Verify.info
   and value = Field_name.t * Unstrctrd.t
   and user's_set = value * value * value
   and user's_chain = user's_set list

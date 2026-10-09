@@ -28,3 +28,6 @@ build: [
   ["dune" "runtest" "-p" name "-j" jobs] {with-test}
 ]
 x-maintenance-intent: [ "(latest)" ]
+pin-depends: [
+  "dmarc.dev" "git+https://github.com/dinosaure/ocaml-dmarc.git#d5832f064b820a0ef0be1e4fc63808c6cd3ef6fa"
+]
