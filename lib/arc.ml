@@ -282,13 +282,18 @@ module Verify = struct
       let pk = Dkim.public_key (snd set.seal) in
       let alg = Dkim.algorithm (fst set.seal).seal in
       let seal_ok =
-        match (X509.Public_key.decode_der pk, alg) with
-        | Ok (`RSA key), `RSA ->
-            Mirage_crypto_pk.Rsa.PKCS1.verify ~hashp ~key ~signature
-              (`Digest msg)
-        | Ok (`ED25519 key), `ED25519 ->
-            Mirage_crypto_ec.Ed25519.verify ~key signature ~msg
-        | _ -> false in
+        match alg with
+        | `RSA ->
+            begin match X509.Public_key.decode_der pk with
+            | Ok (`RSA key) ->
+                Mirage_crypto_pk.Rsa.PKCS1.verify ~hashp ~key ~signature
+                  (`Digest msg)
+            | _ -> false
+            end
+        | `ED25519 ->
+        match Mirage_crypto_ec.Ed25519.pub_of_octets pk with
+        | Ok key -> Mirage_crypto_ec.Ed25519.verify ~key signature ~msg
+        | Error _ -> false in
       let b, bh_ok =
         Dkim.Digest.verify ~fields:bh ~domain_key:(snd set.msgsig) value in
       let _, Dkim.Hash_value (k, b') =
