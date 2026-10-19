@@ -1,3 +1,7 @@
+## v0.0.4 (2026-10-19)
+
+- Upgrade to `dmarc.0.0.3` (@dinosaure, 0fede01, 7d423c1)
+
 ## v0.0.3 (2026-08-07)
 
 - Use `mirage-crypto-rng.unix` instead of `mirage-crypto-rng-miou-unix`
